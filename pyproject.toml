@@ -152,7 +152,7 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "scripts"]
-addopts = "-v --cov=mdd --cov-report=term-missing --cov-fail-under=70 -m 'not integration and not office'"
+addopts = "-v --cov=mdd --cov-report=term-missing --cov-fail-under=85 -m 'not integration and not office'"
 markers = [
     "integration: requires a live external service (Confluence, SharePoint, GitLab, Anthropic)",
     "office: requires Microsoft Office installed locally (macOS)",

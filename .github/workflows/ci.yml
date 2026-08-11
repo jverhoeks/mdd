@@ -104,3 +104,15 @@ jobs:
         uses: zizmorcore/zizmor-action@6fc4b006235f201fdab3722e17240ab420d580e5 # v0.6.1
         with:
           advanced-security: false
+      # install: false skips [tools] — this job needs neither Python nor bun.
+      # `mise run` auto-installs the task's own tools (actionlint, shellcheck).
+      - name: Set up mise
+        uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
+        with:
+          install: false
+          cache: true
+      # zizmor above checks whether the workflows are safe; actionlint checks
+      # whether they run at all — schema, expression contexts, the needs: graph,
+      # and shellcheck over each run: block. Neither substitutes for the other.
+      - name: Lint GitHub Actions workflows (actionlint)
+        run: mise run actions-lint

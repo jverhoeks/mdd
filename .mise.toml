@@ -6,7 +6,7 @@
 
 [tools]
 python = "3.14"
-uv = "latest"
+uv = "0.12"
 # Documentation site only. `mise run ci` never touches these, so a contributor
 # working on Python pays nothing for them beyond `mise install`.
 bun = "1.3"
@@ -38,6 +38,17 @@ run = "uv run complexipy src/mdd"
 [tasks.complexipy-snapshot]
 description = "Regenerate complexipy-snapshot.json baseline. Use only for deliberate refactor PRs."
 run = "uv run complexipy --snapshot-create src/mdd"
+
+# Complements the zizmor job in ci.yml rather than duplicating it: zizmor
+# answers "is this workflow safe", actionlint answers "will it run and do what
+# was meant" — the schema, `${{ }}` expressions against the contexts each
+# trigger actually provides, runner labels, the `needs:` graph, and shellcheck
+# over every `run:` block. The tools install on demand, so `mise install`
+# stays cheap for contributors who never touch a workflow.
+[tasks.actions-lint]
+description = "actionlint + shellcheck over .github/workflows"
+tools = { "aqua:rhysd/actionlint" = "1.7", shellcheck = "0.11" }
+run = "actionlint"
 
 [tasks.verify-clean]
 description = "Fail if any tracked file contains git conflict markers"
@@ -88,6 +99,13 @@ depends = [
   "ir-coverage",
   "check-mdd-commands",
 ]
+
+# `mise run ci` passing locally does not mean GitHub agrees: the workflow adds
+# the IR round-trip benchmarks and runs on a clean Linux checkout. Watch the
+# real run after pushing.
+[tasks.ci-watch]
+description = "Watch the latest GitHub Actions run for the current branch"
+run = "gh -R schubergphilis/mdd run watch --exit-status $(gh -R schubergphilis/mdd run list --branch \"$(git branch --show-current)\" --limit 1 --json databaseId --jq '.[0].databaseId')"
 
 [tasks.version]
 description = "Print the resolved version (setuptools-scm, from git tags)"
