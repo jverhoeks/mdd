@@ -19,9 +19,14 @@ mise run ci           # the ci gate
 `mise run ci` is the basic contract. It runs, in order: conflict-marker
 check, `ruff check` + `ruff format --check`, `basedpyright` in strict mode,
 the `complexipy` cognitive-complexity gate, `pip-audit` over the dependency
-closure, the unit suite with coverage checks (aim >90% for new code).
+closure, the unit suite with coverage checks (floor 85%, aim >90% for new
+code).
 
-GitHub will also run the IR round-trip suite: `mise run ir-roundtrip-bench`.
+GitHub also runs the IR round-trip benchmarks (`mise run ir-roundtrip-bench`),
+a `zizmor` security audit of the workflows, and `mise run actions-lint`. None
+of the three are in the local `ci` gate. `mise run ci-watch` follows the real
+run once you have pushed — a green local gate is not the same thing as a
+green workflow.
 
 A pull request is expected to be green before review. In particular:
 

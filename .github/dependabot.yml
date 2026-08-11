@@ -6,6 +6,15 @@ updates:
       interval: "weekly"
     cooldown:
       default-days: 7
+  # The documentation site under site/ is a separate bun project with its own
+  # tracked bun.lock. `mise run ci` never builds it, so nothing else notices
+  # when its dependencies go stale.
+  - package-ecosystem: "bun"
+    directory: "/site"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

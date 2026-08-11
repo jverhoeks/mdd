@@ -16,6 +16,7 @@ anyone reading the repository directly.
 | [design-record/](design-record/) | Introduction to the two directories below | contributors |
 | [spec/](spec/) | The durable design record, one file per feature — start at [000-specs.md](spec/000-specs.md) | contributors, AI agents |
 | [research/](research/) | Surveys, spikes and measurements, recorded when the work happened — start at [000-research.md](research/000-research.md) | contributors, AI agents |
+| [agents/](agents/) | Working conventions for AI agents that [AGENTS.md](../AGENTS.md) is too short to carry — currently [issue-tracker.md](agents/issue-tracker.md) | AI agents |
 
 Specs and research notes describe **intent at the time of writing**. They are
 not maintained as the code moves, and a research note may recommend an approach

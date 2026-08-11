@@ -1,6 +1,10 @@
 # AI agent instructions for mdd
 
-[README.md](README.md) explains the project.
+This file (`AGENTS.md`) is the canonical agent configuration. `CLAUDE.md` is a
+symlink to this file.
+
+[README.md](README.md) explains the project: bidirectional, near-lossless sync
+between Markdown-in-git and Confluence/SharePoint.
 
 [CONTRIBUTING.md](CONTRIBUTING.md) explains how to make open source contributions.
 
@@ -29,7 +33,7 @@ already ships. Invoke one with a `/` prefix when the task matches:
 
 Code must have full type annotations and be `ruff`-formated.
 
-Code should have high test coverage (gate is 70%, but aim 90%+ for new code).
+Code should have high test coverage (gate is 85%, but aim 90%+ for new code).
 
 See `docs/spec/S34-code-quality-gates.md` for details.
 
@@ -72,6 +76,23 @@ Use `gh` to work with GitHub, main upstream repo is `schubergphilis/mdd`:
 * `gh issue` for issue tracking
 * commit code on branches and make PRs
 * PRs are merged after human review or explicit instruction
+
+The working tree has several remotes (`gitlab`, `lsimons`, `bot`) besides
+`origin`, so pass `-R schubergphilis/mdd` to `gh` rather than letting it guess.
+
+### Issue tracker
+
+GitHub issues on `schubergphilis/mdd`. See
+[`docs/agents/issue-tracker.md`](docs/agents/issue-tracker.md).
+
+Never put a closing keyword (`closes #NNN`) in a commit that lands on `main` —
+it closes the issue before the work is reviewed. Put it in the PR body.
+
+### Triage labels
+
+`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`,
+alongside the kind labels `bug`, `documentation`, `enhancement`. See
+[`docs/agents/issue-tracker.md`](docs/agents/issue-tracker.md) for the flow.
 
 ## Session completion
 
