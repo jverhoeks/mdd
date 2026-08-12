@@ -2,7 +2,7 @@
 
 **Purpose:** Establish a shared `mdd.ai` package wrapping a LiteLLM gateway with uniform retry, concurrency, and caching.
 
-**Status:** Implemented (2026-05-08)
+**Status:** Implemented (2026-08-13)
 
 ## Introduction
 
@@ -73,14 +73,31 @@ ai:
 - Cache hit path is purely local; the returned `ChatResult` has
   `cached=True` and `prompt_tokens=0` so accounting reflects only
   what was actually billed.
+- The cache entry also stores `finish_reason`, so a cache hit
+  reports the same completeness signal as the live call did.
 - TTL eviction: any cache file older than `ai.cache_ttl_days`
   (default 30) is purged on the next cache access. Out-of-band:
   `mdd ai cache prune` and `mdd ai cache clear`.
 
+**Truncated completions are never cached**
+- A completion is *complete* when its `finish_reason` is `stop`,
+  `end_turn` or `stop_sequence`, or when the field is absent (some
+  gateways omit it, and entries written before the field existed
+  have nothing to report). Anything else — notably `length`, or
+  `max_tokens` as some gateways spell it — means the model was cut
+  off mid-answer.
+- A truncated completion is returned to the caller but **not
+  written to the cache**, and the client logs a warning naming the
+  model, the finish reason, and the completion-token count.
+- Rationale: a truncated completion is a prefix of the real answer.
+  Caching it would make every later run reproduce the same partial
+  output from disk, with no API call to notice the problem — the
+  failure would become permanent and free.
+
 **Cost / token reporting**
 - Each `chat()` call returns a `ChatResult` containing the response
-  text, `cached` flag, `prompt_tokens`, `completion_tokens`, and
-  `cost_usd` (when the proxy returns it).
+  text, `cached` flag, `prompt_tokens`, `completion_tokens`,
+  `cost_usd` (when the proxy returns it), and `finish_reason`.
 - A run-level accumulator at `mdd.ai.Client.summary` aggregates
   totals; commands print them at end-of-run.
 
@@ -111,7 +128,11 @@ prompt) pass `cache_key_extra` bytes.
 ## Out of scope
 
 - Streaming responses. v1 is request/response only; streaming can
-  be added when a use case calls for it (`mdd ai chat`?).
+  be added when a use case calls for it (`mdd ai chat`?). The
+  absence of streaming caps how large a `max_tokens` callers may
+  ask for: the Anthropic API rejects a non-streaming request whose
+  `max_tokens` is above roughly 21k. Callers that need a longer
+  single completion must wait for streaming support.
 - Provider-neutral abstractions. The OpenAI SDK is sufficient
   against the LiteLLM proxy; we don't try to swap in Anthropic SDK
   later.
