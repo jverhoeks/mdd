@@ -28,6 +28,23 @@ class AiServerError(AiError):
     """Raised when a 5xx error persists after all retries."""
 
 
+COMPLETE_FINISH_REASONS: frozenset[str] = frozenset({"stop", "end_turn", "stop_sequence"})
+"""Finish reasons that mean the model produced a whole answer.
+
+Anything else (notably ``"length"``, or ``"max_tokens"`` as some gateways
+spell it) means the completion was cut off mid-stream, so the text is only a
+prefix of the intended answer and must not be trusted or cached."""
+
+
+def is_complete(finish_reason: str | None) -> bool:
+    """Return True if *finish_reason* indicates an un-truncated completion.
+
+    ``None`` counts as complete: some gateways omit the field entirely, and a
+    cache entry written before the field existed has no value to report.
+    """
+    return finish_reason is None or finish_reason in COMPLETE_FINISH_REASONS
+
+
 @dataclass(frozen=True)
 class ChatResult:
     """Result of a single chat() call."""
@@ -37,6 +54,9 @@ class ChatResult:
     prompt_tokens: int
     completion_tokens: int
     cost_usd: float | None
+    finish_reason: str | None = None
+    """Why the model stopped. ``"stop"``/``"end_turn"`` is a complete answer;
+    ``"length"`` means the completion was cut off by the token limit."""
 
 
 @dataclass(frozen=True)

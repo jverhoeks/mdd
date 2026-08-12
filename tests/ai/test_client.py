@@ -39,13 +39,18 @@ def _make_config(tmp_path: Path, *, concurrency: int = 4) -> AiConfig:
     )
 
 
-def _make_completion(text: str, prompt_tokens: int = 10, completion_tokens: int = 5) -> Any:  # pyright: ignore[reportAny]
+def _make_completion(
+    text: str,
+    prompt_tokens: int = 10,
+    completion_tokens: int = 5,
+    finish_reason: str | None = "stop",
+) -> Any:  # pyright: ignore[reportAny]
     usage = SimpleNamespace(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
     )
     message = SimpleNamespace(content=text)
-    choice = SimpleNamespace(message=message)
+    choice = SimpleNamespace(message=message, finish_reason=finish_reason)
     return SimpleNamespace(choices=[choice], usage=usage)
 
 
@@ -72,6 +77,38 @@ class TestClientChat:
         assert result.cached is False
         assert result.prompt_tokens == 10
         assert result.completion_tokens == 5
+
+    def test_finish_reason_reported(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path)
+        client = Client(config=config)
+        completion = _make_completion("Partial ans", finish_reason="length")
+
+        with patch.object(client, "_fetch_available_models", return_value=_ALL_MODELS):
+            mock_oai = MagicMock()
+            mock_oai.chat.completions.create.return_value = completion
+            client._oai = mock_oai  # pyright: ignore[reportPrivateUsage]
+
+            result = client.chat(user="Hello!")
+
+        assert result.finish_reason == "length"
+
+    def test_truncated_response_not_cached(self, tmp_path: Path) -> None:
+        """A cut-off completion must not poison the cache for later runs."""
+        config = _make_config(tmp_path)
+        client = Client(config=config)
+        completion = _make_completion("Partial ans", finish_reason="length")
+
+        with patch.object(client, "_fetch_available_models", return_value=_ALL_MODELS):
+            mock_oai = MagicMock()
+            mock_oai.chat.completions.create.return_value = completion
+            client._oai = mock_oai  # pyright: ignore[reportPrivateUsage]
+
+            first = client.chat(user="Same prompt")
+            second = client.chat(user="Same prompt")
+
+        assert mock_oai.chat.completions.create.call_count == 2
+        assert first.cached is False
+        assert second.cached is False
 
     def test_cache_hit_on_second_call(self, tmp_path: Path) -> None:
         config = _make_config(tmp_path)

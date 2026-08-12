@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -20,6 +20,9 @@ from mdd.ai.rewrite import (
     _load_constraints as _load_constraints,  # pyright: ignore[reportPrivateUsage]
 )
 from mdd.ai.rewrite import _load_tone as _load_tone  # pyright: ignore[reportPrivateUsage]
+from mdd.ai.rewrite import (
+    _restore_boundary_whitespace as _restore_boundary_whitespace,  # pyright: ignore[reportPrivateUsage]
+)
 from mdd.ai.rewrite import (
     _split_frontmatter as _split_frontmatter,  # pyright: ignore[reportPrivateUsage]
 )
@@ -330,7 +333,7 @@ class TestRewriteFile:
         # Boundary whitespace matches the source exactly — no churn.
         assert src.read_text(encoding="utf-8") == fm + body
 
-    def test_boundary_whitespace_only_whitespace_body_preserved(self, tmp_path: Path) -> None:
+    def test_whitespace_only_body_is_skipped_untouched(self, tmp_path: Path) -> None:
         body = "\n\n  \n"
         src = tmp_path / "page.md"
         src.write_text(body, encoding="utf-8")
@@ -339,8 +342,12 @@ class TestRewriteFile:
 
         result = rewrite_file(src, mock_client, apply=True)  # pyright: ignore[reportArgumentType]
 
-        assert result.status == "rewritten"
+        assert result.status == "skipped"
         assert src.read_text(encoding="utf-8") == body
+
+    def test_whitespace_only_model_output_keeps_source_body(self) -> None:
+        """A model that returns only whitespace must not blank the body."""
+        assert _restore_boundary_whitespace("\n\n  \n", "   \n") == "\n\n  \n"
 
     def test_missing_placeholder_returns_error(self, tmp_path: Path) -> None:
         src = tmp_path / "page.md"
@@ -353,6 +360,112 @@ class TestRewriteFile:
 
         assert result.status == "error"
         assert "missing" in (result.error or "").lower()
+
+    def test_missing_placeholder_dumps_model_output(self, tmp_path: Path) -> None:
+        src = tmp_path / "page.md"
+        src.write_text("Some prose.\n\n```python\nx=1\n```\n\nMore prose.\n", encoding="utf-8")
+
+        mock_client = _make_mock_client("Some prose. More prose.")
+
+        result = rewrite_file(src, mock_client)  # pyright: ignore[reportArgumentType]
+
+        assert result.fail_path == tmp_path / "page.md.rewrite.fail"
+        assert result.fail_path is not None
+        dump = result.fail_path.read_text(encoding="utf-8")
+        # Header carries the diagnosis; the raw model output follows verbatim.
+        assert "kind=fenced" in dump
+        assert "present=False" in dump
+        assert dump.endswith("Some prose. More prose.")
+        # The dump must not look like a markdown page to the next sweep.
+        assert result.fail_path.suffix != ".md"
+
+    def test_truncated_completion_refused(self, tmp_path: Path) -> None:
+        src = tmp_path / "page.md"
+        src.write_text("# Hello\n\nSome text.\n", encoding="utf-8")
+
+        mock_client = _make_mock_client("# Hello\n\nSome tex")
+        mock_client.chat.return_value = ChatResult(
+            text="# Hello\n\nSome tex",
+            cached=False,
+            prompt_tokens=10,
+            completion_tokens=5,
+            finish_reason="length",
+            cost_usd=None,
+        )
+
+        result = rewrite_file(src, mock_client, apply=True)  # pyright: ignore[reportArgumentType]
+
+        assert result.status == "error"
+        assert "finish_reason='length'" in (result.error or "")
+        # The source is untouched and the partial output is available for review.
+        assert src.read_text(encoding="utf-8") == "# Hello\n\nSome text.\n"
+        assert result.fail_path is not None
+        assert result.fail_path.read_text(encoding="utf-8").endswith("# Hello\n\nSome tex")
+
+    def test_large_shrink_warns_but_still_writes(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        src = tmp_path / "page.md"
+        src.write_text("# Hello\n\n" + ("Some sentence of prose. " * 40) + "\n", encoding="utf-8")
+
+        mock_client = _make_mock_client("# Hello\n\nSome sentence of prose.\n")
+
+        with caplog.at_level("WARNING", logger="mdd.ai.rewrite"):
+            result = rewrite_file(src, mock_client, apply=True)  # pyright: ignore[reportArgumentType]
+
+        assert result.status == "rewritten"
+        assert "shrank" in caplog.text
+
+    def test_stub_page_skipped_without_api_call(self, tmp_path: Path) -> None:
+        """A heading plus a macro has nothing to rewrite — do not spend a call on it."""
+        src = tmp_path / "page.md"
+        body = (
+            "\n> **Confluence export**\n>\n> Exported from confluence.\n\n"
+            '# 02. Recent Changes\n\n{{confluence:recently-updated max="100"}}\n'
+        )
+        src.write_text(body, encoding="utf-8")
+
+        mock_client = _make_mock_client("whatever")
+
+        result = rewrite_file(src, mock_client, apply=True)  # pyright: ignore[reportArgumentType]
+
+        assert result.status == "skipped"
+        mock_client.chat.assert_not_called()
+        assert src.read_text(encoding="utf-8") == body
+
+    def test_one_prose_line_is_enough_to_rewrite(self, tmp_path: Path) -> None:
+        """The skip is about *kind* of content, not length — short prose still counts."""
+        src = tmp_path / "page.md"
+        src.write_text("# Title\n\nSome text.\n", encoding="utf-8")
+
+        mock_client = _make_mock_client("# Title\n\nRewritten text.\n")
+
+        result = rewrite_file(src, mock_client, apply=True)  # pyright: ignore[reportArgumentType]
+
+        assert result.status == "rewritten"
+
+    def test_max_tokens_scales_with_input(self, tmp_path: Path) -> None:
+        """The gateway default (4096) truncates long pages, so ask for enough."""
+        src = tmp_path / "page.md"
+        src.write_text("# Title\n\n" + ("Some sentence of prose. " * 2000), encoding="utf-8")
+
+        mock_client = _make_mock_client("# Title\n\nShort.\n")
+
+        _ = rewrite_file(src, mock_client)  # pyright: ignore[reportArgumentType]
+
+        max_tokens = cast("int", mock_client.chat.call_args.kwargs["max_tokens"])
+        assert max_tokens > 4096
+        assert max_tokens <= 16384
+
+    def test_max_tokens_has_a_floor_for_short_pages(self, tmp_path: Path) -> None:
+        src = tmp_path / "page.md"
+        src.write_text("# Title\n\n" + ("Some sentence of prose. " * 20), encoding="utf-8")
+
+        mock_client = _make_mock_client("# Title\n\nShort.\n")
+
+        _ = rewrite_file(src, mock_client)  # pyright: ignore[reportArgumentType]
+
+        assert mock_client.chat.call_args.kwargs["max_tokens"] == 1024
 
     def test_cache_hit_returns_cached_status(self, tmp_path: Path) -> None:
         src = tmp_path / "page.md"

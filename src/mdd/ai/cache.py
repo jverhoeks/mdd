@@ -95,6 +95,7 @@ class CacheEntry(FrontmatterModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cost_usd: float | None = None
+    finish_reason: str | None = None
     timestamp: float = 0.0
 
 
@@ -150,6 +151,7 @@ class FileSystemCache:
         prompt_tokens: int,
         completion_tokens: int,
         cost_usd: float | None,
+        finish_reason: str | None = None,
     ) -> None:
         """Write a new entry to the cache."""
         path = self._entry_path(key)
@@ -160,6 +162,7 @@ class FileSystemCache:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             cost_usd=cost_usd,
+            finish_reason=finish_reason,
             timestamp=time.time(),
         )
         # Atomic write: write to .tmp then rename
