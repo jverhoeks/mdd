@@ -16,8 +16,12 @@ from mdd.ai.models import (
     ChatResult,
     EmbedResult,
     RunSummary,
+    is_complete,
 )
 from mdd.ai.retry import with_retry
+from mdd.utils.logging import get_logger
+
+log = get_logger(__name__)
 
 _EMBED_DIMENSIONS: int | None = None
 
@@ -170,6 +174,14 @@ class Client:
                 prompt_tokens=0,
                 completion_tokens=0,
                 cost_usd=None,
+                finish_reason=cached_entry.finish_reason,
+            )
+            log.debug(
+                "chat cache hit: model=%s task=%s key=%s chars=%d",
+                resolved_model,
+                task,
+                cache_key[:12],
+                len(result.text),
             )
             self._summary.record_chat(result)
             return result
@@ -186,10 +198,19 @@ class Client:
                     prompt_tokens=0,
                     completion_tokens=0,
                     cost_usd=None,
+                    finish_reason=cached_entry.finish_reason,
                 )
                 self._summary.record_chat(result)
                 return result
 
+            log.debug(
+                "chat request: model=%s task=%s system_chars=%d user_chars=%d max_tokens=%s",
+                resolved_model,
+                task,
+                len(system) if system else 0,
+                len(user),
+                max_tokens,
+            )
             result = self._do_chat(
                 resolved_model=resolved_model,
                 messages=messages,
@@ -230,6 +251,9 @@ class Client:
         raw_text: Any = choice.message.content  # pyright: ignore[reportAny,reportUnknownVariableType,reportUnknownMemberType]
         text: str = str(raw_text) if raw_text is not None else ""  # pyright: ignore[reportUnknownArgumentType]
 
+        raw_finish: Any = choice.finish_reason  # pyright: ignore[reportAny,reportUnknownVariableType,reportUnknownMemberType]
+        finish_reason: str | None = str(raw_finish) if raw_finish else None  # pyright: ignore[reportUnknownArgumentType]
+
         usage: Any = response.usage  # pyright: ignore[reportAny,reportUnknownVariableType,reportUnknownMemberType]
         prompt_tokens: int = int(usage.prompt_tokens) if usage and usage.prompt_tokens else 0  # pyright: ignore[reportAny,reportUnknownVariableType,reportUnknownMemberType,reportUnknownArgumentType]
         completion_tokens: int = (
@@ -246,20 +270,54 @@ class Client:
                 if cost_usd is not None:
                     break
 
-        self._cache.put(
-            cache_key,
-            text=text,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            cost_usd=cost_usd,
+        log.debug(
+            "chat response: model=%s finish_reason=%s chars=%d prompt_tokens=%d "
+            "completion_tokens=%d",
+            resolved_model,
+            finish_reason,
+            len(text),
+            prompt_tokens,
+            completion_tokens,
         )
 
-        return ChatResult(
+        result = ChatResult(
             text=text,
             cached=False,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             cost_usd=cost_usd,
+            finish_reason=finish_reason,
+        )
+        self._cache_unless_truncated(cache_key, resolved_model, result)
+        return result
+
+    def _cache_unless_truncated(
+        self,
+        cache_key: str,
+        resolved_model: str,
+        result: ChatResult,
+    ) -> None:
+        """Store *result*, unless the model was cut off mid-answer.
+
+        A truncated completion is a prefix of the real answer; caching it would
+        make every later run reproduce the same partial output from disk.
+        """
+        if not is_complete(result.finish_reason):
+            log.warning(
+                "model %s stopped early (finish_reason=%s) after %d completion tokens; "
+                "response NOT cached",
+                resolved_model,
+                result.finish_reason,
+                result.completion_tokens,
+            )
+            return
+        self._cache.put(
+            cache_key,
+            text=result.text,
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            cost_usd=result.cost_usd,
+            finish_reason=result.finish_reason,
         )
 
     def embed(

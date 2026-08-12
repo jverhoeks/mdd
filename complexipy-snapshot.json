@@ -10,16 +10,6 @@
     ]
   },
   {
-    "path": "src/mdd/ai/rewrite.py",
-    "file_name": "rewrite.py",
-    "functions": [
-      {
-        "name": "rewrite_file",
-        "complexity": 17
-      }
-    ]
-  },
-  {
     "path": "src/mdd/confluence/client/__init__.py",
     "file_name": "__init__.py",
     "functions": [

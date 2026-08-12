@@ -10,7 +10,7 @@ Usage::
         style_path=None,   # use bundled default
         apply=False,       # write <file>.rewrite.md sibling
     )
-    print(result.status)  # "rewritten" | "cached" | "error"
+    print(result.status)  # "rewritten" | "cached" | "skipped" | "error"
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 import yaml  # pyright: ignore[reportMissingModuleSource]
 
+from mdd.ai.models import ChatResult, is_complete
 from mdd.utils.logging import get_logger
 
 if TYPE_CHECKING:
@@ -87,6 +88,7 @@ _PROTECTED_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 class _Region:
     placeholder: str
     original: str
+    kind: str = "unknown"
 
 
 def extract_protected(text: str) -> tuple[str, list[_Region]]:
@@ -103,12 +105,14 @@ def extract_protected(text: str) -> tuple[str, list[_Region]]:
     while pos < len(text):
         earliest_match: re.Match[str] | None = None
         earliest_start = len(text)
+        earliest_kind = "unknown"
 
-        for _name, pattern in _PROTECTED_PATTERNS:
+        for name, pattern in _PROTECTED_PATTERNS:
             m = pattern.search(text, pos)
             if m and m.start() < earliest_start:
                 earliest_match = m
                 earliest_start = m.start()
+                earliest_kind = name
 
         if earliest_match is None:
             # No more protected regions — append the rest.
@@ -119,7 +123,13 @@ def extract_protected(text: str) -> tuple[str, list[_Region]]:
         result_parts.append(text[pos : earliest_match.start()])
 
         placeholder = f"{_PLACEHOLDER_PREFIX}{idx}{_PLACEHOLDER_SUFFIX}"
-        regions.append(_Region(placeholder=placeholder, original=earliest_match.group()))
+        regions.append(
+            _Region(
+                placeholder=placeholder,
+                original=earliest_match.group(),
+                kind=earliest_kind,
+            )
+        )
         result_parts.append(placeholder)
         idx += 1
         pos = earliest_match.end()
@@ -135,12 +145,47 @@ def stitch_protected(text: str, regions: list[_Region]) -> str:
     for region in regions:
         if region.placeholder not in text:
             raise ValueError(
-                f"Protected-region placeholder {region.placeholder!r} is missing from "
+                f"Protected-region placeholder {region.placeholder!r} "
+                f"(kind={region.kind}) is missing from "
                 "the model's output. The model likely removed or rewrote a protected "
                 "block. Refusing to produce output — the rewrite is unsafe."
             )
         text = text.replace(region.placeholder, region.original, 1)
     return text
+
+
+# Matches both intact placeholders and mangled near-misses (case-folded,
+# spaces or backticks inserted, index dropped), so diagnostics can say
+# *how* the model damaged the token rather than only that it is gone.
+_PLACEHOLDER_ISH = re.compile(
+    r"[_`* ]{0,4}MDD[_`* -]{0,4}PROTECTED[_`* -]*\d*[_`* ]{0,4}",
+    re.IGNORECASE,
+)
+
+
+def diagnose_placeholders(text: str, regions: list[_Region]) -> str:
+    """Return a human-readable report on placeholder survival in *text*.
+
+    Lists every protected region, whether its placeholder is present in the
+    model's output, and any placeholder-like tokens the model emitted that
+    do not match an expected placeholder exactly.
+    """
+    lines: list[str] = []
+    lines.append(f"protected regions: {len(regions)}")
+    for region in regions:
+        present = region.placeholder in text
+        preview = region.original.strip().splitlines()[0][:70] if region.original.strip() else ""
+        lines.append(
+            f"  {region.placeholder} kind={region.kind} "
+            f"chars={len(region.original)} present={present} first_line={preview!r}"
+        )
+
+    expected = {r.placeholder for r in regions}
+    found = {m.group().strip() for m in _PLACEHOLDER_ISH.finditer(text)}
+    unexpected = sorted(tok for tok in found if tok not in expected)
+    if unexpected:
+        lines.append(f"placeholder-like tokens in output not matching any region: {unexpected}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -251,12 +296,203 @@ class RewriteResult:
     """Result of rewriting one file."""
 
     path: Path
-    status: str  # "rewritten" | "cached" | "error"
+    status: str  # "rewritten" | "cached" | "skipped" | "error"
     output_path: Path | None = None
     error: str | None = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cost_usd: float | None = None
+    fail_path: Path | None = None
+    """Where the rejected model output was dumped, if anywhere."""
+
+
+# Deliberately not ``.md``: a dump must not be picked up by the next
+# ``find . -name '*.md'`` sweep and rewritten in turn.
+_FAIL_SUFFIX = ".rewrite.fail"
+
+# Warn when the rewritten body keeps less than this fraction of the source.
+_SHRINK_WARN_RATIO = 0.9
+
+# Output-token budget. Left unset, the gateway applies its own default (4096
+# for the Anthropic models behind LiteLLM), which silently truncates any page
+# whose rewrite is longer than that.
+_CHARS_PER_TOKEN = 4  # rough estimate for English markdown
+_OUTPUT_HEADROOM = 1.5  # a rewrite is usually shorter than its source, but not always
+_MIN_OUTPUT_TOKENS = 1024
+_MAX_OUTPUT_TOKENS = 16384  # conservative floor across the Claude-family caps
+
+# Lines that carry nothing a tone rewrite can improve: ATX headings (which the
+# constraints forbid touching anyway) and standalone macro calls.
+_HEADING_LINE = re.compile(r"^#{1,6}\s")
+_MACRO_LINE = re.compile(r"^\{\{[^\n]*\}\}$")
+
+
+def _output_token_budget(path: Path, sent: str) -> int:
+    """Return the ``max_tokens`` to allow for rewriting *sent*.
+
+    Scaled from the input length, since a rewrite is about as long as its
+    source, and clamped to a range every Claude-family model accepts.
+    """
+    estimate = int(len(sent) / _CHARS_PER_TOKEN * _OUTPUT_HEADROOM)
+    budget = max(_MIN_OUTPUT_TOKENS, min(_MAX_OUTPUT_TOKENS, estimate))
+    if estimate > _MAX_OUTPUT_TOKENS:
+        log.warning(
+            "rewrite %s: %d chars needs an estimated %d output tokens, capped at %d — "
+            "the rewrite may be refused as truncated; consider splitting the page",
+            path,
+            len(sent),
+            estimate,
+            _MAX_OUTPUT_TOKENS,
+        )
+    return budget
+
+
+def _rewritable_prose(transformed_body: str, regions: list[_Region]) -> str:
+    """Return the part of *transformed_body* a tone rewrite could actually change.
+
+    Drops placeholder tokens, headings and standalone macro calls.  What is
+    left empty means the page is a stub — a title and a Confluence macro, say —
+    and there is no reason to spend a model call on it, let alone risk one.
+    """
+    placeholders = {region.placeholder for region in regions}
+    kept: list[str] = []
+    for raw in transformed_body.splitlines():
+        line = raw.strip()
+        if not line or line in placeholders:
+            continue
+        if _HEADING_LINE.match(line) or _MACRO_LINE.match(line):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def _pct_delta(before: int, after: int) -> float:
+    """Return the percentage change from *before* to *after* (0.0 if empty)."""
+    if before == 0:
+        return 0.0
+    return (after - before) / before * 100.0
+
+
+def _region_summary(regions: list[_Region]) -> str:
+    """Return a compact ``kind=count`` summary of *regions* for log lines."""
+    counts: dict[str, int] = {}
+    for region in regions:
+        counts[region.kind] = counts.get(region.kind, 0) + 1
+    return ", ".join(f"{kind}={n}" for kind, n in sorted(counts.items())) or "none"
+
+
+def _write_fail_dump(
+    path: Path,
+    *,
+    reason: str,
+    model_text: str,
+    diagnostics: str,
+) -> Path | None:
+    """Dump the rejected model output next to *path* for inspection.
+
+    Returns the dump path, or None if it could not be written.  The dump is
+    the raw model output verbatim, prefixed by an HTML-comment header holding
+    *reason* and *diagnostics*, so the body can still be diffed against the
+    source with the header skipped.
+    """
+    fail_path = path.parent / (path.name + _FAIL_SUFFIX)
+    header = "\n".join(
+        [
+            "<!-- mdd ai rewrite: rejected model output",
+            f"source:      {path}",
+            f"reason:      {reason}",
+            *(f"             {line}" for line in diagnostics.splitlines()),
+            "-->",
+            "",
+        ]
+    )
+    try:
+        fail_path.write_text(header + model_text, encoding="utf-8")
+    except OSError as exc:
+        log.warning("could not write failure dump %s: %s", fail_path, exc)
+        return None
+    return fail_path
+
+
+def _rejected(
+    path: Path,
+    *,
+    reason: str,
+    chat: ChatResult,
+    diagnostics: str,
+) -> RewriteResult:
+    """Dump the unusable model output and return the matching error result."""
+    log.debug("rewrite %s rejected: %s\n%s", path, reason, diagnostics)
+    fail_path = _write_fail_dump(path, reason=reason, model_text=chat.text, diagnostics=diagnostics)
+    suffix = f" Model output dumped to {fail_path}." if fail_path else ""
+    return RewriteResult(
+        path=path,
+        status="error",
+        error=reason + suffix,
+        fail_path=fail_path,
+        prompt_tokens=chat.prompt_tokens,
+        completion_tokens=chat.completion_tokens,
+        cost_usd=chat.cost_usd,
+    )
+
+
+def _stitch_or_reject(
+    path: Path,
+    *,
+    chat: ChatResult,
+    regions: list[_Region],
+    sent: str,
+) -> str | RewriteResult:
+    """Return the stitched body, or a ``RewriteResult`` error if it is unusable.
+
+    Two ways the model output is unusable: the completion was truncated, or a
+    protected-region placeholder did not come back.  Either way the rejected
+    output is dumped for inspection rather than discarded.
+    """
+    diagnostics = (
+        f"model_finish_reason: {chat.finish_reason}\n"
+        f"cached: {chat.cached}\n"
+        f"tokens: prompt={chat.prompt_tokens} completion={chat.completion_tokens}\n"
+        f"sent {len(sent)} chars, model returned {len(chat.text)} chars\n"
+        + diagnose_placeholders(chat.text, regions)
+    )
+
+    # A truncated completion is a prefix of the intended rewrite. Stitching it
+    # would silently delete whatever the model never got around to emitting.
+    if not is_complete(chat.finish_reason):
+        return _rejected(
+            path,
+            reason=(
+                f"Model stopped early (finish_reason={chat.finish_reason!r}) after "
+                f"{chat.completion_tokens} completion tokens: the output is truncated. "
+                "Refusing to produce output."
+            ),
+            chat=chat,
+            diagnostics=diagnostics,
+        )
+
+    try:
+        return stitch_protected(chat.text, regions)
+    except ValueError as exc:
+        return _rejected(path, reason=str(exc), chat=chat, diagnostics=diagnostics)
+
+
+def _warn_if_shrunk(path: Path, body: str, rewritten_body: str) -> None:
+    """Warn when the rewrite dropped a suspicious amount of the source body.
+
+    A placeholder check cannot catch this: unprotected prose has no marker to
+    lose, so a model that silently skips half a page still stitches cleanly.
+    """
+    if len(rewritten_body) >= len(body) * _SHRINK_WARN_RATIO:
+        return
+    log.warning(
+        "rewrite %s shrank from %d to %d chars (%+.1f%%) — check the diff before "
+        "keeping it; content may have been dropped",
+        path,
+        len(body),
+        len(rewritten_body),
+        _pct_delta(len(body), len(rewritten_body)),
+    )
 
 
 def _check_managed_for_apply(path: Path, full_text: str) -> bool:  # noqa: ARG001
@@ -285,6 +521,45 @@ def _check_managed_for_apply(path: Path, full_text: str) -> bool:  # noqa: ARG00
         return bool(managed_by)
     except Exception:
         return False
+
+
+def _refuse_managed_apply(
+    path: Path,
+    *,
+    full_text: str,
+    rewritten_full: str,
+    chat: ChatResult,
+) -> RewriteResult | None:
+    """Return an error result if *path* is managed elsewhere, else ``None``.
+
+    A managed-elsewhere page must not be overwritten in place, but the
+    candidate rewrite is still worth having, so it lands in the usual
+    ``<path>.rewrite.md`` sibling.
+    """
+    try:
+        blocked = _check_managed_for_apply(path, full_text)
+    except Exception:
+        blocked = False
+    if not blocked:
+        return None
+
+    out_path = path.parent / (path.name + ".rewrite.md")
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+    try:
+        tmp_path.write_text(rewritten_full, encoding="utf-8")
+        tmp_path.replace(out_path)
+    except OSError as exc:
+        tmp_path.unlink(missing_ok=True)
+        return RewriteResult(path=path, status="error", error=f"Write failed: {exc}")
+    return RewriteResult(
+        path=path,
+        status="error",
+        error=f"Managed-elsewhere page: --apply refused. Candidate written to {out_path}.",
+        output_path=out_path,
+        prompt_tokens=chat.prompt_tokens,
+        completion_tokens=chat.completion_tokens,
+        cost_usd=chat.cost_usd,
+    )
 
 
 def rewrite_file(  # noqa: C901, PLR0911, PLR0912, PLR0915
@@ -358,6 +633,24 @@ def rewrite_file(  # noqa: C901, PLR0911, PLR0912, PLR0915
     # included so a bundled-prompt upgrade invalidates stale rewrites.
     cache_key_extra = body_hash + tone_digest + constraints_digest
 
+    log.debug(
+        "rewrite %s: file=%d chars, frontmatter=%d, body=%d, sent=%d, protected regions=%d (%s)",
+        path,
+        len(full_text),
+        len(frontmatter_block),
+        len(body),
+        len(transformed_body),
+        len(regions),
+        _region_summary(regions),
+    )
+
+    if not _rewritable_prose(transformed_body, regions):
+        log.debug(
+            "rewrite %s: skipping, nothing but headings, macros and protected blocks",
+            path,
+        )
+        return RewriteResult(path=path, status="skipped")
+
     try:
         result = client.chat(
             system=system_prompt,
@@ -365,48 +658,43 @@ def rewrite_file(  # noqa: C901, PLR0911, PLR0912, PLR0915
             task="default",
             model=model,
             cache_key_extra=cache_key_extra,
+            max_tokens=_output_token_budget(path, transformed_body),
         )
     except Exception as exc:
         return RewriteResult(path=path, status="error", error=str(exc))
 
-    # Stitch protected regions back.
-    try:
-        rewritten_body = stitch_protected(result.text, regions)
-    except ValueError as exc:
-        return RewriteResult(path=path, status="error", error=str(exc))
+    log.debug(
+        "rewrite %s: model returned %d chars (sent %d, %+.1f%%), cached=%s, "
+        "finish_reason=%s, tokens prompt=%d completion=%d",
+        path,
+        len(result.text),
+        len(transformed_body),
+        _pct_delta(len(transformed_body), len(result.text)),
+        result.cached,
+        result.finish_reason,
+        result.prompt_tokens,
+        result.completion_tokens,
+    )
+
+    # Validate the completion and stitch the protected regions back.
+    stitched = _stitch_or_reject(path, chat=result, regions=regions, sent=transformed_body)
+    if isinstance(stitched, RewriteResult):
+        return stitched
+    rewritten_body = stitched
 
     # Restore the source body's boundary whitespace to avoid whitespace-only churn.
     rewritten_body = _restore_boundary_whitespace(body, rewritten_body)
+    _warn_if_shrunk(path, body, rewritten_body)
 
     rewritten_full = frontmatter_block + rewritten_body
 
     # When --apply is set, check for managed-elsewhere before overwriting.
     if apply:
-        try:
-            _apply_blocked = _check_managed_for_apply(path, full_text)
-        except Exception:
-            _apply_blocked = False
-        if _apply_blocked:
-            # Refuse apply but still emit the candidate sibling.
-            out_path = path.parent / (path.name + ".rewrite.md")
-            tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
-            try:
-                tmp_path.write_text(rewritten_full, encoding="utf-8")
-                tmp_path.replace(out_path)
-            except OSError as exc:
-                tmp_path.unlink(missing_ok=True)
-                return RewriteResult(path=path, status="error", error=f"Write failed: {exc}")
-            return RewriteResult(
-                path=path,
-                status="error",
-                error=(
-                    f"Managed-elsewhere page: --apply refused. Candidate written to {out_path}."
-                ),
-                output_path=out_path,
-                prompt_tokens=result.prompt_tokens,
-                completion_tokens=result.completion_tokens,
-                cost_usd=result.cost_usd,
-            )
+        refusal = _refuse_managed_apply(
+            path, full_text=full_text, rewritten_full=rewritten_full, chat=result
+        )
+        if refusal is not None:
+            return refusal
 
     # Determine output path and write atomically.
     if apply:
@@ -456,24 +744,45 @@ def rewrite_files(
 def _print_file_result(result: RewriteResult) -> None:
     if result.status == "error":
         log.error("  error:    %s  — %s", result.path, result.error)
+        if result.fail_path is not None:
+            log.error("            rejected model output: %s", result.fail_path)
+    elif result.status == "skipped":
+        log.info("  skipped:  %s  — no prose to rewrite", result.path)
     elif result.status == "cached":
         log.info("  cached:   %s", result.path)
     else:
         log.info("  rewritten:%s  →  %s", result.path, result.output_path)
 
 
+def _log_status_counts(results: list[RewriteResult]) -> None:
+    """Log the one-line status tally."""
+    counts: dict[str, int] = {}
+    for r in results:
+        counts[r.status] = counts.get(r.status, 0) + 1
+    log.info(
+        "Rewrite summary: %d rewritten, %d cached, %d skipped, %d error(s).",
+        counts.get("rewritten", 0),
+        counts.get("cached", 0),
+        counts.get("skipped", 0),
+        counts.get("error", 0),
+    )
+
+
+def _log_fail_dumps(results: list[RewriteResult]) -> None:
+    """Log where the rejected model output for failed files landed."""
+    dumps = [r.fail_path for r in results if r.fail_path is not None]
+    if not dumps:
+        return
+    log.info("  Rejected model output written to %d dump file(s):", len(dumps))
+    for dump in dumps:
+        log.info("    %s", dump)
+
+
 def print_run_summary(results: list[RewriteResult], client: Client) -> None:
     """Log a concise end-of-run summary."""
-    cached = sum(1 for r in results if r.status == "cached")
-    rewritten = sum(1 for r in results if r.status == "rewritten")
-    errors = sum(1 for r in results if r.status == "error")
     summary = client.summary
-    log.info(
-        "Rewrite summary: %d rewritten, %d cached, %d error(s).",
-        rewritten,
-        cached,
-        errors,
-    )
+    _log_status_counts(results)
+    _log_fail_dumps(results)
     if summary.api_calls > 0:
         tokens = summary.prompt_tokens + summary.completion_tokens
         log.info(
