@@ -16,6 +16,7 @@ Usage::
 from __future__ import annotations
 
 import hashlib
+import itertools
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -316,10 +317,27 @@ _SHRINK_WARN_RATIO = 0.9
 # Output-token budget. Left unset, the gateway applies its own default (4096
 # for the Anthropic models behind LiteLLM), which silently truncates any page
 # whose rewrite is longer than that.
-_CHARS_PER_TOKEN = 4  # rough estimate for English markdown
-_OUTPUT_HEADROOM = 1.5  # a rewrite is usually shorter than its source, but not always
-_MIN_OUTPUT_TOKENS = 1024
-_MAX_OUTPUT_TOKENS = 16384  # conservative floor across the Claude-family caps
+#
+# The value is flat rather than scaled from the input length. It is a ceiling,
+# not a spend — the caller is billed for the tokens the model actually
+# generates — so there is nothing to save by guessing a tighter number, and
+# every guess is wrong in the same direction: the chars-per-token ratio of real
+# markdown varies with markup density (roughly 2.25 to 3.09 chars per token
+# across the pages we measured), so an estimate that fits the average
+# under-budgets the dense pages and they come back truncated.
+#
+# It is not higher because these are non-streaming requests, which the
+# Anthropic API rejects outright once max_tokens climbs past roughly 21k.
+# Raising the ceiling therefore means teaching the client to stream first,
+# which is a larger change than this one. Pages that need more output than the
+# ceiling allows are split into chunks instead.
+_MAX_OUTPUT_TOKENS = 16384
+
+# Target size of one chunk of transformed body, in characters. Sized so a
+# chunk's rewrite comfortably fits _MAX_OUTPUT_TOKENS even at the densest
+# chars-per-token ratio we have measured, with room for the model to grow the
+# text a little.
+_CHUNK_TARGET_CHARS = 8000
 
 # Lines that carry nothing a tone rewrite can improve: ATX headings (which the
 # constraints forbid touching anyway) and standalone macro calls.
@@ -327,24 +345,91 @@ _HEADING_LINE = re.compile(r"^#{1,6}\s")
 _MACRO_LINE = re.compile(r"^\{\{[^\n]*\}\}$")
 
 
-def _output_token_budget(path: Path, sent: str) -> int:
-    """Return the ``max_tokens`` to allow for rewriting *sent*.
+# ---------------------------------------------------------------------------
+# Chunking
+# ---------------------------------------------------------------------------
 
-    Scaled from the input length, since a rewrite is about as long as its
-    source, and clamped to a range every Claude-family model accepts.
+_H2_BOUNDARY = re.compile(r"(?m)^## ")
+_H3_BOUNDARY = re.compile(r"(?m)^### ")
+_PARAGRAPH_BOUNDARY = re.compile(r"\n[ \t]*\n")
+_LINE_BOUNDARY = re.compile(r"\n")
+
+
+def _boundary_offsets(text: str, pattern: re.Pattern[str], *, at_end: bool) -> list[int]:
+    """Return the offsets in *text* at which a new segment may start.
+
+    *at_end* selects whether the boundary sits after the matched separator (a
+    blank line or a newline, which belongs to the preceding segment) or at the
+    start of the match (a heading marker, which belongs to the following one).
     """
-    estimate = int(len(sent) / _CHARS_PER_TOKEN * _OUTPUT_HEADROOM)
-    budget = max(_MIN_OUTPUT_TOKENS, min(_MAX_OUTPUT_TOKENS, estimate))
-    if estimate > _MAX_OUTPUT_TOKENS:
-        log.warning(
-            "rewrite %s: %d chars needs an estimated %d output tokens, capped at %d — "
-            "the rewrite may be refused as truncated; consider splitting the page",
-            path,
-            len(sent),
-            estimate,
-            _MAX_OUTPUT_TOKENS,
-        )
-    return budget
+    offsets = {0}
+    for match in pattern.finditer(text):
+        offset = match.end() if at_end else match.start()
+        if 0 < offset < len(text):
+            offsets.add(offset)
+    return sorted(offsets)
+
+
+def _segments(text: str, offsets: list[int]) -> list[str]:
+    """Slice *text* at *offsets*; the pieces concatenate back to *text*."""
+    bounds = [*offsets, len(text)]
+    return [text[start:end] for start, end in itertools.pairwise(bounds)]
+
+
+# Splitting hierarchy, most preferred boundary first. Each entry is
+# (pattern, boundary_sits_after_match).
+_SPLIT_LEVELS: list[tuple[re.Pattern[str], bool]] = [
+    (_H2_BOUNDARY, False),
+    (_H3_BOUNDARY, False),
+    (_PARAGRAPH_BOUNDARY, True),
+    (_LINE_BOUNDARY, True),
+]
+
+
+def _pack(pieces: list[str], target: int) -> list[str]:
+    """Greedily merge adjacent *pieces* while the result stays under *target*."""
+    packed: list[str] = []
+    for piece in pieces:
+        if packed and len(packed[-1]) + len(piece) <= target:
+            packed[-1] += piece
+        else:
+            packed.append(piece)
+    return packed
+
+
+def _split_at_level(text: str, target: int, level: int) -> list[str]:
+    """Split *text* under *target* chars, starting at *level* of the hierarchy."""
+    if len(text) <= target:
+        return [text]
+    if level >= len(_SPLIT_LEVELS):
+        # Out of boundaries: this is a single line longer than the target.
+        # Emit it whole — a placeholder token occupies a whole line, and
+        # splitting mid-line could cut one in half.
+        return [text]
+
+    pattern, at_end = _SPLIT_LEVELS[level]
+    segments = _segments(text, _boundary_offsets(text, pattern, at_end=at_end))
+    if len(segments) <= 1:
+        return _split_at_level(text, target, level + 1)
+
+    pieces: list[str] = []
+    for segment in segments:
+        pieces.extend(_split_at_level(segment, target, level + 1))
+    return _pack(pieces, target)
+
+
+def split_into_chunks(text: str, target: int = _CHUNK_TARGET_CHARS) -> list[str]:
+    """Split *text* into chunks of at most *target* characters where possible.
+
+    Boundaries are preferred in this order: ``## `` headings, ``### ``
+    headings, blank-line paragraph breaks, then hard line breaks. A chunk that
+    is a single line longer than *target* is emitted as-is.
+
+    The split is pure slicing: ``"".join(split_into_chunks(t)) == t`` always
+    holds, byte for byte. Nothing is trimmed, normalised or re-joined with a
+    separator.
+    """
+    return _split_at_level(text, target, 0)
 
 
 def _rewritable_prose(transformed_body: str, regions: list[_Region]) -> str:
@@ -436,6 +521,16 @@ def _rejected(
     )
 
 
+def _call_diagnostics(chat: ChatResult, sent: str) -> str:
+    """Return the shared header lines describing one model call."""
+    return (
+        f"model_finish_reason: {chat.finish_reason}\n"
+        f"cached: {chat.cached}\n"
+        f"tokens: prompt={chat.prompt_tokens} completion={chat.completion_tokens}\n"
+        f"sent {len(sent)} chars, model returned {len(chat.text)} chars"
+    )
+
+
 def _stitch_or_reject(
     path: Path,
     *,
@@ -445,36 +540,148 @@ def _stitch_or_reject(
 ) -> str | RewriteResult:
     """Return the stitched body, or a ``RewriteResult`` error if it is unusable.
 
-    Two ways the model output is unusable: the completion was truncated, or a
-    protected-region placeholder did not come back.  Either way the rejected
-    output is dumped for inspection rather than discarded.
+    The output is unusable when a protected-region placeholder did not come
+    back.  The rejected output is dumped for inspection rather than discarded.
     """
-    diagnostics = (
-        f"model_finish_reason: {chat.finish_reason}\n"
-        f"cached: {chat.cached}\n"
-        f"tokens: prompt={chat.prompt_tokens} completion={chat.completion_tokens}\n"
-        f"sent {len(sent)} chars, model returned {len(chat.text)} chars\n"
-        + diagnose_placeholders(chat.text, regions)
-    )
-
-    # A truncated completion is a prefix of the intended rewrite. Stitching it
-    # would silently delete whatever the model never got around to emitting.
-    if not is_complete(chat.finish_reason):
-        return _rejected(
-            path,
-            reason=(
-                f"Model stopped early (finish_reason={chat.finish_reason!r}) after "
-                f"{chat.completion_tokens} completion tokens: the output is truncated. "
-                "Refusing to produce output."
-            ),
-            chat=chat,
-            diagnostics=diagnostics,
-        )
-
     try:
         return stitch_protected(chat.text, regions)
     except ValueError as exc:
+        diagnostics = (
+            _call_diagnostics(chat, sent) + "\n" + diagnose_placeholders(chat.text, regions)
+        )
         return _rejected(path, reason=str(exc), chat=chat, diagnostics=diagnostics)
+
+
+def _chunk_cache_key(chunk: str, prompt_digest: bytes) -> bytes:
+    """Return the cache-key extra for one chunk: chunk + tone + constraints.
+
+    *prompt_digest* is the tone digest followed by the constraints digest. The
+    constraints digest is in there so a bundled-prompt upgrade invalidates
+    stale rewrites.
+    """
+    return hashlib.sha256(chunk.encode()).digest() + prompt_digest
+
+
+def _reject_truncated_chunk(
+    path: Path,
+    *,
+    chat: ChatResult,
+    chunk: str,
+    index: int,
+    total: int,
+) -> RewriteResult:
+    """Refuse the whole file because one chunk came back truncated.
+
+    A truncated completion is a prefix of the intended rewrite, and a file that
+    is half in the new tone and half in the old is worse than a clear failure
+    the operator can retry, so one bad chunk fails everything.
+    """
+    label = f"chunk {index} of {total}"
+    where = "" if total == 1 else f"On {label}: "
+    scope = "output" if total == 1 else "output for the whole file"
+    return _rejected(
+        path,
+        reason=(
+            f"{where}Model stopped early (finish_reason={chat.finish_reason!r}) after "
+            f"{chat.completion_tokens} completion tokens: the output is truncated. "
+            f"Refusing to produce {scope}."
+        ),
+        chat=chat,
+        diagnostics=f"failed at:  {label}\n" + _call_diagnostics(chat, chunk),
+    )
+
+
+def _merge_chunk_results(parts: list[str], results: list[ChatResult]) -> ChatResult:
+    """Fold the per-chunk results into one whole-file ``ChatResult``."""
+    costs = [r.cost_usd for r in results if r.cost_usd is not None]
+    return ChatResult(
+        text="".join(parts),
+        cached=all(r.cached for r in results),
+        prompt_tokens=sum(r.prompt_tokens for r in results),
+        completion_tokens=sum(r.completion_tokens for r in results),
+        cost_usd=sum(costs) if costs else None,
+        finish_reason=results[-1].finish_reason,
+    )
+
+
+def _plan_chunks(path: Path, transformed_body: str) -> list[str]:
+    """Split *transformed_body* into chunks and log what the split produced."""
+    chunks = split_into_chunks(transformed_body)
+    if len(chunks) > 1:
+        log.info(
+            "rewrite %s: %d chars split into %d chunks of at most %d chars",
+            path,
+            len(transformed_body),
+            len(chunks),
+            _CHUNK_TARGET_CHARS,
+        )
+    log.debug(
+        "rewrite %s: %d chunk(s), sizes %s",
+        path,
+        len(chunks),
+        [len(chunk) for chunk in chunks],
+    )
+    return chunks
+
+
+def _rewrite_chunks(
+    path: Path,
+    client: Client,
+    *,
+    chunks: list[str],
+    system_prompt: str,
+    model: str | None,
+    prompt_digest: bytes,
+) -> ChatResult | RewriteResult:
+    """Rewrite every chunk serially and return the concatenated result.
+
+    Returns a ``RewriteResult`` error instead if any chunk came back truncated:
+    the whole file is refused rather than half-rewritten.
+    """
+    total = len(chunks)
+    parts: list[str] = []
+    results: list[ChatResult] = []
+
+    for index, chunk in enumerate(chunks, start=1):
+        try:
+            chat = client.chat(
+                system=system_prompt,
+                user=chunk,
+                task="default",
+                model=model,
+                cache_key_extra=_chunk_cache_key(chunk, prompt_digest),
+                max_tokens=_MAX_OUTPUT_TOKENS,
+            )
+        except Exception as exc:
+            return RewriteResult(path=path, status="error", error=str(exc))
+
+        log.debug(
+            "rewrite %s: chunk %d of %d returned %d chars (sent %d, %+.1f%%), cached=%s, "
+            "finish_reason=%s, tokens prompt=%d completion=%d",
+            path,
+            index,
+            total,
+            len(chat.text),
+            len(chunk),
+            _pct_delta(len(chunk), len(chat.text)),
+            chat.cached,
+            chat.finish_reason,
+            chat.prompt_tokens,
+            chat.completion_tokens,
+        )
+
+        if not is_complete(chat.finish_reason):
+            return _reject_truncated_chunk(path, chat=chat, chunk=chunk, index=index, total=total)
+
+        # A model that trims a chunk's leading or trailing whitespace would
+        # otherwise weld two lines together across the join.  With a single
+        # chunk there is no join, and the whole-body restore that follows does
+        # the same job, so the model's text is kept verbatim — which is also
+        # what a failure dump should contain.
+        parts.append(chat.text if total == 1 else _restore_boundary_whitespace(chunk, chat.text))
+        results.append(chat)
+
+    return _merge_chunk_results(parts, results)
 
 
 def _warn_if_shrunk(path: Path, body: str, rewritten_body: str) -> None:
@@ -623,15 +830,10 @@ def rewrite_file(  # noqa: C901, PLR0911, PLR0912, PLR0915
     # Split off frontmatter so it is not sent to the model.
     frontmatter_block, body = _split_frontmatter(full_text)
 
-    # Compute the body hash for the cache key.
-    body_hash = hashlib.sha256(body.encode()).digest()
-
-    # Extract protected regions from the body.
+    # Extract protected regions from the body.  This happens before chunking so
+    # placeholder numbering stays global and no chunk boundary can fall inside
+    # a table or a fenced block.
     transformed_body, regions = extract_protected(body)
-
-    # Cache key extra: body + tone + constraints. Constraints digest is
-    # included so a bundled-prompt upgrade invalidates stale rewrites.
-    cache_key_extra = body_hash + tone_digest + constraints_digest
 
     log.debug(
         "rewrite %s: file=%d chars, frontmatter=%d, body=%d, sent=%d, protected regions=%d (%s)",
@@ -651,32 +853,21 @@ def rewrite_file(  # noqa: C901, PLR0911, PLR0912, PLR0915
         )
         return RewriteResult(path=path, status="skipped")
 
-    try:
-        result = client.chat(
-            system=system_prompt,
-            user=transformed_body,
-            task="default",
-            model=model,
-            cache_key_extra=cache_key_extra,
-            max_tokens=_output_token_budget(path, transformed_body),
-        )
-    except Exception as exc:
-        return RewriteResult(path=path, status="error", error=str(exc))
+    chunks = _plan_chunks(path, transformed_body)
 
-    log.debug(
-        "rewrite %s: model returned %d chars (sent %d, %+.1f%%), cached=%s, "
-        "finish_reason=%s, tokens prompt=%d completion=%d",
+    outcome = _rewrite_chunks(
         path,
-        len(result.text),
-        len(transformed_body),
-        _pct_delta(len(transformed_body), len(result.text)),
-        result.cached,
-        result.finish_reason,
-        result.prompt_tokens,
-        result.completion_tokens,
+        client,
+        chunks=chunks,
+        system_prompt=system_prompt,
+        model=model,
+        prompt_digest=tone_digest + constraints_digest,
     )
+    if isinstance(outcome, RewriteResult):
+        return outcome
+    result = outcome
 
-    # Validate the completion and stitch the protected regions back.
+    # Stitch the protected regions back once, over the joined output.
     stitched = _stitch_or_reject(path, chat=result, regions=regions, sent=transformed_body)
     if isinstance(stitched, RewriteResult):
         return stitched

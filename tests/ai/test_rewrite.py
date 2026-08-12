@@ -11,6 +11,12 @@ import pytest
 
 from mdd.ai.models import ChatResult
 from mdd.ai.rewrite import (
+    _CHUNK_TARGET_CHARS as _CHUNK_TARGET_CHARS,  # pyright: ignore[reportPrivateUsage]
+)
+from mdd.ai.rewrite import (
+    _MAX_OUTPUT_TOKENS as _MAX_OUTPUT_TOKENS,  # pyright: ignore[reportPrivateUsage]
+)
+from mdd.ai.rewrite import (
     _compose_system_prompt as _compose_system_prompt,  # pyright: ignore[reportPrivateUsage]
 )
 from mdd.ai.rewrite import (
@@ -26,7 +32,13 @@ from mdd.ai.rewrite import (
 from mdd.ai.rewrite import (
     _split_frontmatter as _split_frontmatter,  # pyright: ignore[reportPrivateUsage]
 )
-from mdd.ai.rewrite import extract_protected, rewrite_file, rewrite_files, stitch_protected
+from mdd.ai.rewrite import (
+    extract_protected,
+    rewrite_file,
+    rewrite_files,
+    split_into_chunks,
+    stitch_protected,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -43,6 +55,20 @@ def _make_chat_result(text: str, cached: bool = False) -> ChatResult:
         completion_tokens=5,
         cost_usd=None,
     )
+
+
+def _paragraph(marker: str, words: int = 60) -> str:
+    """Return one identifiable paragraph of prose."""
+    return f"{marker} " + ("some sentence of ordinary prose. " * words) + "\n\n"
+
+
+def _long_page(sections: int, paragraphs: int = 3) -> str:
+    """Return a page of *sections* H2 sections, each well over the chunk target."""
+    parts = ["# Title\n\nIntro prose paragraph.\n\n"]
+    for s in range(sections):
+        parts.append(f"## Section {s}\n\n")
+        parts.extend(_paragraph(f"s{s}p{p}", 40) for p in range(paragraphs))
+    return "".join(parts)
 
 
 def _make_mock_client(return_text: str, cached: bool = False) -> MagicMock:
@@ -177,6 +203,82 @@ class TestProtectedRegionPipeline:
         transformed, regions = extract_protected(text)
         assert "~~~" not in transformed
         assert len(regions) == 1
+
+
+# ---------------------------------------------------------------------------
+# split_into_chunks
+# ---------------------------------------------------------------------------
+
+
+class TestSplitIntoChunks:
+    def test_short_text_is_one_chunk(self) -> None:
+        text = "# Title\n\nShort prose.\n"
+        assert split_into_chunks(text) == [text]
+
+    def test_empty_text_round_trips(self) -> None:
+        assert "".join(split_into_chunks("")) == ""
+
+    def test_join_is_byte_identical(self) -> None:
+        text = _long_page(8)
+        chunks = split_into_chunks(text)
+        assert len(chunks) > 1
+        assert "".join(chunks) == text
+
+    def test_join_is_byte_identical_on_corpus_fixture(self) -> None:
+        """The invariant must hold on real markdown, at every target size."""
+        content = (FIXTURES_DIR / "protected.md").read_text(encoding="utf-8")
+        transformed, _regions = extract_protected(content)
+        for target in (10, 40, 200, 1000, _CHUNK_TARGET_CHARS):
+            chunks = split_into_chunks(transformed, target)
+            assert "".join(chunks) == transformed, f"join broken at target={target}"
+
+    def test_splits_on_h2_boundaries(self) -> None:
+        text = _long_page(4)
+        chunks = split_into_chunks(text)
+        # Every chunk after the first starts at a heading, not mid-section.
+        for chunk in chunks[1:]:
+            assert chunk.startswith("## "), chunk[:40]
+
+    def test_falls_back_to_h3_within_one_h2_section(self) -> None:
+        body = "".join(f"### Sub {i}\n\n{_paragraph(f'x{i}', 40)}" for i in range(12))
+        text = "## Only Section\n\n" + body
+        chunks = split_into_chunks(text)
+        assert len(chunks) > 1
+        for chunk in chunks[1:]:
+            assert chunk.startswith("### "), chunk[:40]
+
+    def test_falls_back_to_paragraphs_within_one_section(self) -> None:
+        text = "## Only Section\n\n" + "".join(_paragraph(f"p{i}", 40) for i in range(12))
+        chunks = split_into_chunks(text)
+        assert len(chunks) > 1
+        assert "".join(chunks) == text
+        # No chunk starts mid-paragraph: each one begins with a paragraph marker.
+        for chunk in chunks[1:]:
+            assert chunk.startswith("p"), chunk[:20]
+
+    def test_falls_back_to_lines_within_one_paragraph(self) -> None:
+        # One paragraph, no blank lines: only hard line breaks are available.
+        text = "\n".join(f"line {i} " + ("word " * 40) for i in range(80))
+        chunks = split_into_chunks(text)
+        assert len(chunks) > 1
+        assert "".join(chunks) == text
+        for chunk in chunks:
+            assert len(chunk) <= _CHUNK_TARGET_CHARS
+
+    def test_one_enormous_unbroken_line_is_emitted_whole(self) -> None:
+        """A page that is a single line has no boundary to split on."""
+        text = "word " * 5000
+        chunks = split_into_chunks(text)
+        assert chunks == [text]
+
+    def test_chunks_stay_under_target_when_boundaries_allow(self) -> None:
+        chunks = split_into_chunks(_long_page(8))
+        assert all(len(chunk) <= _CHUNK_TARGET_CHARS for chunk in chunks)
+
+    def test_small_sections_are_packed_together(self) -> None:
+        """Boundaries are opportunities, not mandates — do not emit tiny chunks."""
+        text = "".join(f"## S{i}\n\nA little prose.\n\n" for i in range(20))
+        assert split_into_chunks(text) == [text]
 
 
 # ---------------------------------------------------------------------------
@@ -444,20 +546,8 @@ class TestRewriteFile:
 
         assert result.status == "rewritten"
 
-    def test_max_tokens_scales_with_input(self, tmp_path: Path) -> None:
-        """The gateway default (4096) truncates long pages, so ask for enough."""
-        src = tmp_path / "page.md"
-        src.write_text("# Title\n\n" + ("Some sentence of prose. " * 2000), encoding="utf-8")
-
-        mock_client = _make_mock_client("# Title\n\nShort.\n")
-
-        _ = rewrite_file(src, mock_client)  # pyright: ignore[reportArgumentType]
-
-        max_tokens = cast("int", mock_client.chat.call_args.kwargs["max_tokens"])
-        assert max_tokens > 4096
-        assert max_tokens <= 16384
-
-    def test_max_tokens_has_a_floor_for_short_pages(self, tmp_path: Path) -> None:
+    def test_max_tokens_is_the_flat_cap(self, tmp_path: Path) -> None:
+        """The gateway default (4096) truncates long pages, so ask for the cap."""
         src = tmp_path / "page.md"
         src.write_text("# Title\n\n" + ("Some sentence of prose. " * 20), encoding="utf-8")
 
@@ -465,7 +555,31 @@ class TestRewriteFile:
 
         _ = rewrite_file(src, mock_client)  # pyright: ignore[reportArgumentType]
 
-        assert mock_client.chat.call_args.kwargs["max_tokens"] == 1024
+        assert cast("int", mock_client.chat.call_args.kwargs["max_tokens"]) == _MAX_OUTPUT_TOKENS
+
+    def test_max_tokens_does_not_depend_on_page_length(self, tmp_path: Path) -> None:
+        """Every chunk asks for the same ceiling; nothing is estimated per page."""
+        src = tmp_path / "page.md"
+        src.write_text(_long_page(6), encoding="utf-8")
+
+        mock_client = _make_mock_client("Rewritten.\n")
+
+        _ = rewrite_file(src, mock_client)  # pyright: ignore[reportArgumentType]
+
+        assert mock_client.chat.call_count > 1
+        for call in mock_client.chat.call_args_list:
+            assert cast("int", call.kwargs["max_tokens"]) == _MAX_OUTPUT_TOKENS
+
+    def test_single_chunk_page_makes_exactly_one_call(self, tmp_path: Path) -> None:
+        src = tmp_path / "page.md"
+        src.write_text("# Title\n\nSome prose here.\n", encoding="utf-8")
+
+        mock_client = _make_mock_client("# Title\n\nRewritten prose.\n")
+
+        result = rewrite_file(src, mock_client)  # pyright: ignore[reportArgumentType]
+
+        assert result.status == "rewritten"
+        assert mock_client.chat.call_count == 1
 
     def test_cache_hit_returns_cached_status(self, tmp_path: Path) -> None:
         src = tmp_path / "page.md"
@@ -569,6 +683,222 @@ class TestRewriteFile:
         assert result.status == "rewritten"
         content = src.read_text()
         assert table in content
+
+
+class TestRewriteChunkedPage:
+    """A page too long for one completion is rewritten chunk by chunk."""
+
+    @staticmethod
+    def _echo_client(
+        *, truncate_call: int | None = None, cached: bool = False
+    ) -> tuple[MagicMock, list[str]]:
+        """Return a client that echoes each chunk back, and the list of chunks sent."""
+        sent: list[str] = []
+
+        def echo(**kwargs: Any) -> ChatResult:  # pyright: ignore[reportAny]
+            user: str = kwargs["user"]
+            sent.append(user)
+            truncated = truncate_call is not None and len(sent) == truncate_call
+            return ChatResult(
+                text=user.upper() if not truncated else user[:20].upper(),
+                cached=cached,
+                prompt_tokens=10,
+                completion_tokens=5,
+                cost_usd=0.5,
+                finish_reason="length" if truncated else "stop",
+            )
+
+        mock = MagicMock()
+        mock.chat.side_effect = echo
+        mock.summary.api_calls = 1
+        mock.summary.prompt_tokens = 10
+        mock.summary.completion_tokens = 5
+        mock.summary.cost_usd = 0.0
+        return mock, sent
+
+    def test_long_page_is_split_across_calls(self, tmp_path: Path) -> None:
+        src = tmp_path / "page.md"
+        body = _long_page(8)
+        src.write_text(body, encoding="utf-8")
+
+        mock_client, sent = self._echo_client()
+
+        result = rewrite_file(src, mock_client, apply=True)  # pyright: ignore[reportArgumentType]
+
+        assert result.status == "rewritten"
+        assert len(sent) > 1
+        # Nothing was lost or duplicated at the joins.
+        assert "".join(sent) == body
+        assert src.read_text(encoding="utf-8") == body.upper()
+
+    def test_chunk_token_and_cost_totals_are_summed(self, tmp_path: Path) -> None:
+        src = tmp_path / "page.md"
+        src.write_text(_long_page(8), encoding="utf-8")
+
+        mock_client, sent = self._echo_client()
+
+        result = rewrite_file(src, mock_client)  # pyright: ignore[reportArgumentType]
+
+        assert result.prompt_tokens == 10 * len(sent)
+        assert result.completion_tokens == 5 * len(sent)
+        assert result.cost_usd == pytest.approx(0.5 * len(sent))
+
+    def test_each_chunk_gets_its_own_cache_key(self, tmp_path: Path) -> None:
+        src = tmp_path / "page.md"
+        src.write_text(_long_page(8), encoding="utf-8")
+
+        mock_client, sent = self._echo_client()
+
+        rewrite_file(src, mock_client)  # pyright: ignore[reportArgumentType]
+
+        keys = [cast("bytes", c.kwargs["cache_key_extra"]) for c in mock_client.chat.call_args_list]
+        assert len(keys) == len(sent)
+        assert len(set(keys)) == len(keys)
+        # The key is the chunk digest followed by the tone and constraints digests.
+        assert keys[0].startswith(hashlib.sha256(sent[0].encode()).digest())
+
+    def test_all_chunks_cached_reports_cached(self, tmp_path: Path) -> None:
+        src = tmp_path / "page.md"
+        src.write_text(_long_page(8), encoding="utf-8")
+
+        mock_client, _sent = self._echo_client(cached=True)
+
+        result = rewrite_file(src, mock_client)  # pyright: ignore[reportArgumentType]
+
+        assert result.status == "cached"
+
+    def test_one_uncached_chunk_reports_rewritten(self, tmp_path: Path) -> None:
+        src = tmp_path / "page.md"
+        src.write_text(_long_page(8), encoding="utf-8")
+
+        calls: list[str] = []
+
+        def mixed(**kwargs: Any) -> ChatResult:  # pyright: ignore[reportAny]
+            user: str = kwargs["user"]
+            calls.append(user)
+            return ChatResult(
+                text=user.upper(),
+                cached=len(calls) > 1,  # only the first chunk missed the cache
+                prompt_tokens=10,
+                completion_tokens=5,
+                cost_usd=None,
+                finish_reason="stop",
+            )
+
+        mock_client = MagicMock()
+        mock_client.chat.side_effect = mixed
+
+        result = rewrite_file(src, mock_client)  # pyright: ignore[reportArgumentType]
+
+        assert len(calls) > 1
+        assert result.status == "rewritten"
+
+    def test_protected_regions_survive_chunking(self, tmp_path: Path) -> None:
+        table = "| A | B |\n|---|---|\n| 1 | 2 |\n"
+        code = "```python\ndef f():\n    return 42\n```"
+        body = _long_page(4) + f"## Tail\n\n{table}\n{code}\n\n" + _long_page(4)
+        src = tmp_path / "page.md"
+        src.write_text(body, encoding="utf-8")
+
+        mock_client, sent = self._echo_client()
+
+        result = rewrite_file(src, mock_client, apply=True)  # pyright: ignore[reportArgumentType]
+
+        assert result.status == "rewritten"
+        assert len(sent) > 1
+        # No chunk boundary fell inside a protected block, and both blocks came
+        # back byte-identical rather than upper-cased.
+        content = src.read_text(encoding="utf-8")
+        assert table in content
+        assert code in content
+
+    def test_truncated_chunk_refuses_the_whole_file(self, tmp_path: Path) -> None:
+        src = tmp_path / "page.md"
+        body = _long_page(8)
+        src.write_text(body, encoding="utf-8")
+
+        mock_client, sent = self._echo_client(truncate_call=2)
+
+        result = rewrite_file(src, mock_client, apply=True)  # pyright: ignore[reportArgumentType]
+
+        assert result.status == "error"
+        assert "finish_reason='length'" in (result.error or "")
+        # Nothing was written: a file half in the new tone is worse than a failure.
+        assert src.read_text(encoding="utf-8") == body
+        # And no chunk after the failing one was paid for.
+        assert len(sent) == 2
+
+    def test_truncation_dump_names_the_failing_chunk(self, tmp_path: Path) -> None:
+        src = tmp_path / "page.md"
+        src.write_text(_long_page(8), encoding="utf-8")
+
+        mock_client, _sent = self._echo_client(truncate_call=2)
+
+        result = rewrite_file(src, mock_client)  # pyright: ignore[reportArgumentType]
+
+        assert result.fail_path is not None
+        dump = result.fail_path.read_text(encoding="utf-8")
+        total = len(split_into_chunks(extract_protected(_long_page(8))[0]))
+        assert f"chunk 2 of {total}" in dump
+        assert f"chunk 2 of {total}" in (result.error or "")
+
+    def test_split_is_logged(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        src = tmp_path / "page.md"
+        src.write_text(_long_page(8), encoding="utf-8")
+
+        mock_client, _sent = self._echo_client()
+
+        with caplog.at_level("INFO", logger="mdd.ai.rewrite"):
+            rewrite_file(src, mock_client)  # pyright: ignore[reportArgumentType]
+
+        assert "split into" in caplog.text
+
+    def test_model_trimming_a_chunk_does_not_weld_lines(self, tmp_path: Path) -> None:
+        """A chunk returned without its trailing newline must not join the next."""
+        src = tmp_path / "page.md"
+        body = _long_page(8)
+        src.write_text(body, encoding="utf-8")
+
+        def trimming(**kwargs: Any) -> ChatResult:  # pyright: ignore[reportAny]
+            user: str = kwargs["user"]
+            return ChatResult(
+                text=user.strip(),
+                cached=False,
+                prompt_tokens=10,
+                completion_tokens=5,
+                cost_usd=None,
+                finish_reason="stop",
+            )
+
+        mock_client = MagicMock()
+        mock_client.chat.side_effect = trimming
+
+        result = rewrite_file(src, mock_client, apply=True)  # pyright: ignore[reportArgumentType]
+
+        assert result.status == "rewritten"
+        assert src.read_text(encoding="utf-8") == body
+
+    def test_client_error_mid_run_returns_error(self, tmp_path: Path) -> None:
+        src = tmp_path / "page.md"
+        body = _long_page(8)
+        src.write_text(body, encoding="utf-8")
+
+        calls: list[str] = []
+
+        def boom(**kwargs: Any) -> ChatResult:  # pyright: ignore[reportAny]
+            calls.append(cast("str", kwargs["user"]))
+            if len(calls) == 2:
+                raise RuntimeError("gateway exploded")
+            return _make_chat_result(cast("str", kwargs["user"]))
+
+        mock_client = MagicMock()
+        mock_client.chat.side_effect = boom
+
+        result = rewrite_file(src, mock_client, apply=True)  # pyright: ignore[reportArgumentType]
+
+        assert result.status == "error"
+        assert "gateway exploded" in (result.error or "")
+        assert src.read_text(encoding="utf-8") == body
 
 
 # ---------------------------------------------------------------------------
