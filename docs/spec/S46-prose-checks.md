@@ -1,6 +1,6 @@
 # S46: prose checks and reflow
 
-**Purpose:** `mdd prose` is a group of deterministic, model-free checks and fixers over a Markdown corpus — semantic-line-break reflow, mechanical prose lint, heading-anchor validation, a project-owned vocabulary gate, and a freshness gate — so a corpus can be gated in CI reproducibly and prose diffs stay reviewable.
+**Purpose:** `mdd prose` is a group of deterministic, model-free checks and fixers over a Markdown corpus — semantic-line-break reflow, mechanical prose lint, heading-anchor validation, and a freshness gate — so a corpus can be gated in CI reproducibly and prose diffs stay reviewable.
 
 **Status:** Draft
 
@@ -98,9 +98,8 @@ cannot promise.
 
   ```
   mdd prose reflow      [PATH ...] [--write] [--width N] [--json] …
-  mdd prose lint        [PATH ...] [--json] …
+  mdd prose lint        [PATH ...] [--write] [--json] …
   mdd prose anchors     [PATH ...] [--json] …
-  mdd prose vocabulary  [PATH ...] [--json] …
   mdd prose freshness   [PATH ...] [--json] …
   mdd prose check       [PATH ...] [--json] …
   ```
@@ -204,8 +203,9 @@ cannot promise.
   comment, or frontmatter that does not close is a `parse-error` finding and
   the file is skipped by every check — and, critically, never written to.
 - Mask fidelity is the correctness bar: a masked span is passed through
-  byte-for-byte. A check may look at a masked span (`vocabulary` may want to
-  ignore it; `anchors` must read link targets) but no check may rewrite one.
+  byte-for-byte. A check may look at a masked span (`anchors` must read link
+  targets; `lint`'s literal escape must recognise an `inline-code` span) but no
+  check may rewrite one.
 
 ### `mdd prose reflow` — semantic line breaks
 
@@ -305,14 +305,14 @@ is a test:
 Small mistakes a spell checker cannot see, each with a stable rule id, each
 `error` by default unless noted:
 
-| Rule id | Finds |
-|---|---|
-| `multiple-spaces` | two or more spaces between words on a prose line |
-| `space-before-punctuation` | whitespace before `,` `;` `:` `.` `!` `?` |
-| `blank-run` | more than one consecutive blank line |
-| `trailing-whitespace` | trailing spaces or tabs at end of line |
-| `punctuation-outside-quote` | a `,` or `.` placed after a closing quote where house style puts it inside — **`off` by default** |
-| `invisible-space` | a non-breaking or other invisible space character where a plain space was meant — **`warning`** |
+| Rule id | Finds | `--write` |
+|---|---|---|
+| `multiple-spaces` | two or more spaces between words on a prose line | fixable |
+| `space-before-punctuation` | whitespace before `,` `;` `:` `.` `!` `?` | fixable |
+| `blank-run` | more than one consecutive blank line | fixable |
+| `trailing-whitespace` | trailing spaces or tabs at end of line | fixable |
+| `punctuation-outside-quote` | a `,` or `.` placed after a closing quote where house style puts it inside — **`off` by default** | no |
+| `invisible-space` | a non-breaking or other invisible space character where a plain space was meant — **`warning`** | no |
 
 - `trailing-whitespace` allows exactly **two** trailing spaces, which is
   Markdown's hard line break, unless `allow-hard-break: false` is configured.
@@ -334,9 +334,41 @@ Small mistakes a spell checker cannot see, each with a stable rule id, each
      list. Deliberately conservative — a false skip loses a finding, a false
      flag corrupts text.
   3. The per-line suppression comment, for whatever the first two miss.
-- No rule in this subcommand has an autofix in v1. They are one-character
-  changes, and `reflow` is already the risky writer; see
-  [Open questions](#open-questions).
+**`--write` — the whitespace autofixes**
+
+- `mdd prose lint --write` fixes the rules marked fixable above and reports the
+  rest. The fixable set is exactly the unambiguous whitespace rules:
+  `multiple-spaces`, `space-before-punctuation`, `blank-run` and
+  `trailing-whitespace`. Each is a deletion of whitespace with one correct
+  outcome, and each is reversible by rerunning the check.
+- `invisible-space` is **not** fixable: replacing a non-breaking space with a
+  plain space is sometimes right and sometimes destroys a deliberate
+  typographic choice, and the tool cannot tell which. Neither is
+  `punctuation-outside-quote`: moving a mark across a quote is the change the
+  literal escape above exists to be careful about, and getting it wrong
+  corrupts a literal.
+- A fix touches only bytes inside a span the classifier called `prose`, and only
+  the whitespace the rule matched. No other character in the file changes.
+- `lint --write` is a **strictly smaller** writer than `reflow --write`: it
+  deletes whitespace within a line and never moves text between lines, so no
+  block can change structure. It therefore does not need the
+  rendered-output-equivalence gate reflow needs — but it inherits every other
+  `--write` rule in
+  [Data protection](#data-protection-and-destructive-behaviour) without
+  exception: opt-in per invocation, never from config; atomic write; the file
+  written only if it classified cleanly; `.mddignore` honoured; one `info` line
+  per modified file; `--write` with `--json` an argparse error; and the refusal
+  to rewrite a mirrored file, overridable only with `--allow-mirror`.
+- The mirror refusal is not a formality here. A trailing-whitespace deletion
+  changes the `.md` bytes, so it invalidates
+  [S18](S18-sharepoint-sync.md)'s content hash and bumps
+  [S14](S14-confluence-sync.md)'s mtime exactly as a reflow does, with the same
+  silent consequences.
+- Two writers, not one, is a deliberate reversal of this spec's first draft. The
+  argument that won: these fixes are within-line whitespace deletions with a
+  single correct outcome, which makes them far easier to test exhaustively than
+  reflow, and the blast radius of a bug is a stray space rather than a mangled
+  document.
 
 ### `mdd prose anchors` — internal cross-references resolve
 
@@ -349,10 +381,15 @@ Small mistakes a spell checker cannot see, each with a stable rule id, each
 - **Slugging rule**, stated so it can be relied on and so a project can tell
   whether its renderer agrees: lowercase the heading text; strip Markdown
   inline markup, leaving its text; remove every character that is not a letter,
-  digit, space, hyphen or underscore; replace runs of whitespace with a single
+  digit, space, hyphen or underscore; replace **each** remaining space with one
   hyphen. A heading whose slug collides with an earlier one in the same file
   gets `-1`, `-2`, … appended in document order. This is GitHub's rule, which
   is where the corpora `mdd` mirrors are read.
+- Each space, not each *run* of spaces, and the difference is not academic: a
+  heading like `### foo — bar` loses the em dash and keeps both spaces around
+  it, so its GitHub anchor is `foo--bar` with two hyphens. Collapsing runs would
+  make the check reject every working link of that shape, which is the worst
+  failure a link checker can have.
 - `{#explicit-id}` at the end of a heading line sets the anchor directly,
   overrides the slug, and takes part in collision numbering.
 - `--slug-style` selects the rule if a corpus is published by a renderer that
@@ -368,25 +405,6 @@ Small mistakes a spell checker cannot see, each with a stable rule id, each
 - This check is what makes it *safe* to split, merge or renumber files in a
   large corpus — the operation that is most obviously correct to attempt and
   most reliably breaks something invisible.
-
-### `mdd prose vocabulary` — project-owned house vocabulary
-
-- A project supplies a list of banned phrases; a match is a finding. `mdd`
-  ships **no** phrase list. House vocabulary is a house matter, and a list
-  shipped in a tool becomes an argument in every consuming project.
-- Each entry carries the phrase, an optional `message` explaining what to
-  write instead, and an optional `severity`. Matching is case-insensitive and
-  word-boundary-anchored by default. A `regex: true` entry matches as a regular
-  expression; the flag is explicit so a stray `.` in a phrase never quietly
-  becomes a wildcard.
-- An **accept-list** of words the project has decided are correct lives
-  alongside it, in a plain one-word-per-line file at a stable configured path.
-  `mdd` does not spell-check — that is a solved problem with better tools — but
-  it owns the accept-list's location so the same file can be handed to
-  `codespell`, Vale, or an editor. `mdd prose vocabulary` consults it only to
-  avoid flagging an accepted word that a `regex` entry would otherwise catch.
-- `--list` prints the resolved, merged rule set and exits `0`, so a user can
-  see what is actually in force.
 
 ### `mdd prose freshness` — content that goes stale
 
@@ -419,10 +437,25 @@ Small mistakes a spell checker cannot see, each with a stable rule id, each
   the blacklist is a *safety* list that must not be shrinkable by shadowing. A
   style config is the opposite: a repository must be able to state its whole
   house style in one file a reviewer can read.
+- **Severity precedence, because two keys can set it.** `checks: {lint: …}`
+  sets a whole check's severity; `lint: {rules: {invisible-space: …}}` sets one
+  rule's. The resolution order is:
+  1. `checks.<name>: off` means the check **does not run at all**. Nothing under
+     `<name>.rules` can re-enable it. `off` is a hard stop, so that disabling a
+     check is one edit a reviewer can see rather than one edit plus a search for
+     contradicting overrides.
+  2. Otherwise `checks.<name>` sets the default severity for every rule in that
+     check, replacing the built-in default.
+  3. A rule named in `<name>.rules` takes that severity, overriding step 2.
+     Specific beats general.
+
+  Stated because `--min-severity` turns severity into the build's outcome: a
+  reader of `prose.yaml` must be able to tell what gates CI without knowing
+  which key the implementation happened to consult first.
 - No config file at all is not an error. The default set runs `lint` and
-  `anchors` at their default severities. `reflow`, `vocabulary` and `freshness`
-  do nothing until configured, because each of them either produces a
-  corpus-wide diff or needs project-supplied data to mean anything.
+  `anchors` at their default severities. `reflow` and `freshness` do nothing
+  until configured, because the first produces a corpus-wide diff and the second
+  needs project-supplied data to mean anything.
 - The file is committed to the corpus repository, next to the content it
   governs, and contains no secrets.
 
@@ -433,7 +466,6 @@ prose:
     reflow: error          # off by default; opting in is a corpus-wide diff
     lint: error
     anchors: error
-    vocabulary: error
     freshness: warning
 
   reflow:
@@ -452,17 +484,6 @@ prose:
 
   anchors:
     slug-style: github
-
-  vocabulary:
-    accept-list: .prose-accept.txt
-    banned:
-      - phrase: "leverage"
-        message: "use 'use'"
-      - phrase: "click here"
-        message: "link the destination's name instead"
-      - phrase: '\bsimply\b'
-        regex: true
-        severity: warning
 
   freshness:
     field: last-verified
@@ -483,15 +504,17 @@ prose:
   subcommand sends anything anywhere. If a future subcommand ever did, that
   changes.
 - **`--write` mutates the user's files, so it gets the care every other
-  mutating command in `mdd` gets:**
+  mutating command in `mdd` gets.** There are two writers —
+  `reflow --write` and `lint --write` — and every rule below applies to both:
   - `--write` is opt-in per invocation, never sticky, and never inferred from
     the config file. A config may enable the *check*; only the command line can
     authorise the *write*.
   - Writes are atomic — temp file, `fsync`, rename — reusing the existing
     frontmatter-writer shape rather than a second implementation.
-  - A file is written only if it parsed cleanly, its masking was balanced, and
-    it passed the rendered-output-equivalence check above. Fail closed: any
-    doubt means the file is left exactly as it was and an `error` is reported.
+  - A file is written only if it parsed cleanly and its masking was balanced,
+    and — for `reflow` — only if it passed the rendered-output-equivalence check
+    above. Fail closed: any doubt means the file is left exactly as it was and
+    an `error` is reported.
   - Only files under a `PATH` the user named are ever opened for writing, and
     `.mddignore` is honoured on the write path exactly as on the read path.
   - Each modified file is logged at `info`, one line per file, so a destructive
@@ -505,18 +528,23 @@ prose:
   which is a weaker boundary than the repository. Excerpts are therefore
   trimmed to the flagged span plus a small context window, and `--no-excerpt`
   omits them entirely for jobs whose logs are broadly readable.
-- No subcommand deletes a file, ever. The only mutation in this spec is
-  in-place rewriting of prose lines by `reflow --write`.
+- No subcommand deletes a file, ever. The only mutations in this spec are
+  in-place rewriting of prose lines by `reflow --write` and in-place deletion of
+  prose whitespace by `lint --write`.
 
 ### Interaction with the sync commands
 
 Every read-only check composes with [`mdd confluence sync`](S14-confluence-sync.md)
 and [`mdd sharepoint sync`](S18-sharepoint-sync.md) without any interaction at
-all: reading a file changes nothing either sync looks at. `reflow --write` is
-different, and the interaction is bad enough that it is a requirement here
-rather than a note in the guide.
+all: reading a file changes nothing either sync looks at. The two writers,
+`reflow --write` and `lint --write`, are different, and the interaction is bad
+enough that it is a requirement here rather than a note in the guide. Everything
+below is written about `reflow` because that is where the damage is largest, but
+it applies to `lint --write` unchanged: both sync commands detect a change from
+bytes and mtime, neither of which knows the difference between a moved sentence
+and a deleted trailing space.
 
-**`reflow --write` must refuse to rewrite a mirrored file.** A file is mirrored
+**A `--write` run must refuse to rewrite a mirrored file.** A file is mirrored
 if its frontmatter carries `confluence.page_id` or a `sharepoint.sync` block.
 Such a file is reported under a `mirrored-file` rule (default `error`) and left
 untouched. `--allow-mirror` overrides the refusal for a user who has read this
@@ -612,11 +640,13 @@ tool, because the corruption is silent and lands in a commit.
 `mdd`'s own two-pass Vale invocation. A finding has a severity; the command
 line decides what gates. One pass, no contortion.
 
-**Nothing shipped that is a house-style opinion.** The banned-phrase list is
-empty by default. `punctuation-outside-quote` is off. `reflow` is off. `mdd`
-ships mechanism; each corpus supplies its policy. The exceptions are the
-handful of rules where there is no plausible second opinion — nobody wants two
-spaces before a semicolon.
+**Nothing shipped that is a house-style opinion — and no check whose whole job
+is one.** `punctuation-outside-quote` is off by default. `reflow` is off. There
+is no banned-phrase check at all: what a corpus may say is Vale's job, and
+`mdd prose` does not compete with it (see
+[Out of scope](#out-of-scope)). `mdd` ships mechanism; each corpus supplies its
+policy. The exceptions are the handful of rules where there is no plausible
+second opinion — nobody wants two spaces before a semicolon.
 
 **Path-based scoping.** A gate that walks a configured mirror it was not
 pointed at is a gate that fails for reasons unrelated to the change under
@@ -640,11 +670,16 @@ src/mdd/prose/
         sentences.py          # sentence segmentation, abbreviations, initials
         clauses.py            # clause-boundary detection, greedy packing
         apply.py              # per-block rewriting, IR equivalence check, write
-    lint.py
+    write.py                  # the shared atomic-write + mirror-refusal path
+    lint.py                   # rules, and the whitespace fixers
     anchors.py                # slugging, link extraction, resolution, suggestions
-    vocabulary.py
     freshness.py
 ```
+
+`write.py` exists so the mirror refusal, the atomic replace, the `.mddignore`
+check on the write path and the per-file `info` log are written once and both
+writers call them. Two copies of that logic is how one of them quietly loses the
+mirror check.
 
 `register(subparsers, parents)` adds the `prose` group and its subcommands, and
 `prose.py` joins the registered-module tuple in `src/mdd/cli.py`. Each handler
@@ -731,16 +766,43 @@ order after an AI edit is `mdd ai rewrite --apply`, then `mdd prose reflow
 rejected: it would make a deterministic transformation a side effect of a
 non-deterministic one, and a user who wanted only the first could not get it.
 
-### Relationship to this repository's own prose tooling
+### Relationship to Vale
 
-`mise run docs-vale` and `scripts/spec-check.py` stay as they are. Vale is a Go
-binary with a downloaded style package and a network sync step — fine as a
-development dependency of `mdd` itself, wrong as something `mdd` imposes on
-every corpus it is pointed at. The overlap is small in practice: Vale does
-spelling, term casing and readability advice; `mdd prose` does mechanics,
-structure and layout. Once `mdd prose` exists, `mdd`'s own `docs-check` task
-should run it over `docs/` as well — dogfooding, and the cheapest possible test
-that the checks are tolerable to live with.
+`mdd` already runs Vale over its own hand-written prose (`mise run docs-vale`,
+`.vale.ini`), so the question of wrapping Vale instead of implementing these
+checks was asked directly. The answer is **complement, do not wrap**, and the
+division of labour is: **Vale owns words, `mdd prose` owns mechanics, structure
+and layout.**
+
+Wrapping was rejected because it cannot deliver the feature. Of the checks in
+this spec, Vale can express only one:
+
+| Check | Vale |
+|---|---|
+| `reflow` | Impossible. Vale is a linter with no write path; it cannot reformat anything, and reflow is why this spec exists. |
+| `lint` | Detection expressible as regex rules; fixing not. And Vale is the source of the print-versus-gate problem — `mdd`'s own task runs it twice because its exit code cannot be separated from `MinAlertLevel`. |
+| `anchors` | Impossible. Vale lints each file in isolation and has no cross-file model, so "does a heading in *that* file slug to this anchor" cannot be asked. |
+| `freshness` | Impossible. No typed frontmatter, no date arithmetic. |
+| banned phrases | **Yes, and better than anything here would be.** Delegated to Vale; see [Out of scope](#out-of-scope). |
+
+And wrapping costs three things this spec cannot pay:
+
+- **Determinism.** `.vale.ini` pins a style package fetched over the network by
+  a `vale sync` step. A gate that bootstraps by download is not a pure function
+  of the bytes on disk.
+- **Distribution.** Vale is a Go binary. That is fine as a development
+  dependency of `mdd`, which chooses its own toolchain; it is wrong as something
+  a `uv add mdd` imposes on every corpus `mdd prose` is pointed at.
+- **A second classifier.** Vale has its own notion of which parts of a Markdown
+  file are prose. Running it inside `mdd prose` would reintroduce exactly the
+  disagreement the [shared classifier](#the-shared-line-classifier) exists to
+  make impossible: a span Vale calls prose and the reflow calls code.
+
+So `mise run docs-vale` and `scripts/spec-check.py` stay as they are, and a
+corpus that wants a house vocabulary runs Vale alongside `mdd prose` rather than
+through it. Once `mdd prose` exists, `mdd`'s own `docs-check` task should run it
+over `docs/` next to Vale — dogfooding, and the cheapest possible test that the
+checks are tolerable to live with.
 
 ### Documentation and the CLI-string gate
 
@@ -772,6 +834,14 @@ with them.
   over the existing IR corpus ([S32](S32-ir-test-corpus-expansion.md)), which
   is already the most hostile pile of Markdown in the repository and is exactly
   the right adversary for a reflow.
+- For `lint --write`: a fixture pair per fixable rule, a test that a fixed file
+  is clean on a second run (the same idempotence property reflow has), a test
+  that a file containing only unfixable findings is **not** written at all, and
+  a test that whitespace inside every masked construct survives a `--write` run
+  byte for byte.
+- Both writers are tested against the shared refusals: a mirrored file is left
+  untouched without `--allow-mirror`, `--write --json` is an argparse error, and
+  an ignored file is not written.
 - A test that every rule id appearing in the default config resolves to a real
   rule, and vice versa. Declared-but-nonexistent rule ids are the thing that
   rots first in a configurable linter.
@@ -808,28 +878,41 @@ with them.
 - [S40](S40-typed-frontmatter.md) — typed frontmatter, used by the freshness
   check.
 
-## Open questions
+## Resolved questions
 
-1. Should `mdd prose lint` grow a `--write` autofix for the whitespace rules?
-   They are unambiguous and trivially reversible, so the argument for is
-   strong; the argument against is that a second writer doubles the surface
-   that can corrupt a file. Deferred until `reflow --write` has been lived with.
-2. Is a single `--width` enough, or does a corpus want a different target for
-   list items and block quotes, whose prefixes eat into the line? Probably yes
-   in the long run; one knob until someone complains.
-3. Should `mdd prose check` be able to restrict itself to files changed against
-   a git ref (`--since main`)? Very attractive for adoption — it is the only
-   way to gate a corpus that cannot be fixed in one pass — but it makes the
-   command depend on git state, which is a real complication. Likely a v2.
-4. Does the anchor check need to understand a documentation generator's own
-   routing (a static-site builder mapping `docs/foo.md` to `/foo/`), or is
-   file-relative resolution enough? File-relative is right for a Markdown
-   corpus in git; generator-aware resolution is a different tool. Revisit if
-   [the documentation site](S06-documentation-site.md) wants it.
-5. Should the abbreviation and single-letter-word lists be shareable across
-   projects — a small bundled set per language, selected by config — rather
-   than each corpus curating its own? Only worth it once there are several
-   corpora to compare.
+Recorded rather than deleted, so the reasoning is not re-litigated.
+
+1. **Does `mdd prose lint` get a `--write` autofix for the whitespace rules?**
+   **Yes** — see [the `lint --write` requirements](#mdd-prose-lint--mechanical-slips).
+   The earlier draft deferred it on the grounds that a second writer doubles the
+   surface that can corrupt a file. That was overweighted: a within-line
+   whitespace deletion cannot change block structure, which makes it both safer
+   and *easier to test exhaustively* than reflow, and it is the fix an author
+   most wants applied for them. The four fixable rules are named explicitly and
+   the ambiguous two are excluded.
+2. **Is a single `--width` enough, or do list items and block quotes want their
+   own target?** One knob. A prefix-aware second width is additive if a corpus
+   ever complains, and speculating now buys nothing.
+3. **Should `mdd prose check` restrict itself to files changed against a git ref
+   (`--since main`)?** **No**, not in this spec and not planned. A gate whose
+   answer depends on which commits happen to be in the checkout is a gate that
+   passes locally and fails in CI, or vice versa. The adoption problem it would
+   solve is already solved by the tools this spec has: turn a check on at
+   `warning`, or `.mddignore` the part of the corpus not yet converted, both of
+   which are visible in a committed file rather than implied by a ref.
+4. **Does the anchor check need to understand a documentation generator's
+   routing?** **No.** `mdd prose anchors` resolves links file-relative, against
+   the Markdown corpus as it sits in git. Routing-aware checking belongs to
+   whatever publishes the corpus, and needs that generator's own map to be
+   correct at all — in this repository that is exactly what `scripts/sync-docs.py`
+   and the `docs-links` task already do for [the site](S06-documentation-site.md).
+   Duplicating a guess at it here would produce findings that are wrong in both
+   directions.
+5. **Should the abbreviation and single-letter-word lists be shareable across
+   projects?** **No mechanism for it.** A corpus that wants another corpus's list
+   copies the file, or the two share it however they already share files. That
+   needs no software, and a bundled per-language set would be a house-style
+   opinion shipped in a tool — the thing this spec avoids everywhere else.
 
 ## Out of scope
 
@@ -849,8 +932,18 @@ own tooling, where it can change at the project's pace.
   These need a language toolchain, a build directory, and a project-specific
   convention for how a listing names its file. `mdd` would be guessing at all
   three. A project builds them on top of `mdd prose`, not inside it.
-- **Spell checking.** Solved elsewhere and better. `mdd` owns the accept-list's
-  location so another tool can read it; that is all.
+- **House vocabulary — banned phrases, preferred terms, term casing.** An
+  earlier draft of this spec had a `mdd prose vocabulary` subcommand for it. It
+  is cut, in favour of recommending [Vale](https://vale.sh/), which does the
+  same job better: substitution rules with a replacement message, a `Vocab`
+  accept-and-reject pair, term casing, and an ecosystem of published styles.
+  `mdd` shipped no phrase list anyway, so all the subcommand contributed was a
+  second config schema and a second matcher for a problem already solved.
+  Corpora run Vale alongside `mdd prose`, not through it; see
+  [Relationship to Vale](#relationship-to-vale).
+- **Spell checking, and owning the accept-list's location.** Solved elsewhere
+  and better — Vale's `Vocab`, or `codespell`. With the vocabulary check cut,
+  `mdd` has no reason to have an opinion about where a word list lives either.
 - **Style and readability advice** — passive voice, sentence length, reading
   grade, clichés. Judgement, not mechanics. Vale does it for `mdd`'s own docs,
   and [`mdd ai review`](S22-ai-review-command.md) is where a model's opinion
@@ -863,13 +956,16 @@ own tooling, where it can change at the project's pace.
   ordering. A Markdown formatter is a different tool with a different blast
   radius, and combining the two would make the reflow's one-enormous-diff
   adoption cost even larger.
-- **A `mdd prose fix` that applies every fixable rule at once.** Deliberately
-  absent while there is exactly one writer.
-- **Enforcing a house style out of the box.** No bundled banned-phrase list, no
-  default quote convention, no shipped vocabulary. See
-  [Configuration](#configuration).
+- **A `mdd prose fix` that applies every fixable rule at once.** The two
+  writers stay separate subcommands. `reflow --write` produces a corpus-wide
+  diff and `lint --write` produces a scattering of one-character ones; running
+  both from one flag makes a commit nobody can review, and a user who wanted
+  only the whitespace fixes could not get them.
+- **Enforcing a house style out of the box.** No default quote convention, no
+  shipped word list, and — per the entry above — no vocabulary check to ship one
+  in. See [Configuration](#configuration).
 - **Cross-corpus checks.** Every subcommand runs over the paths it was given.
   Resolving an anchor into a *different* mirror is
   [`mdd search`](S19-search-command.md)'s territory and a much harder problem.
-- **Incremental / changed-files-only operation.** See
-  [Open questions](#open-questions), item 3.
+- **Incremental / changed-files-only operation** (`--since main`). Rejected, not
+  deferred; see [Resolved questions](#resolved-questions), item 3.
