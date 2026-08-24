@@ -508,6 +508,71 @@ prose:
 - No subcommand deletes a file, ever. The only mutation in this spec is
   in-place rewriting of prose lines by `reflow --write`.
 
+### Interaction with the sync commands
+
+Every read-only check composes with [`mdd confluence sync`](S14-confluence-sync.md)
+and [`mdd sharepoint sync`](S18-sharepoint-sync.md) without any interaction at
+all: reading a file changes nothing either sync looks at. `reflow --write` is
+different, and the interaction is bad enough that it is a requirement here
+rather than a note in the guide.
+
+**`reflow --write` must refuse to rewrite a mirrored file.** A file is mirrored
+if its frontmatter carries `confluence.page_id` or a `sharepoint.sync` block.
+Such a file is reported under a `mirrored-file` rule (default `error`) and left
+untouched. `--allow-mirror` overrides the refusal for a user who has read this
+section and accepts what follows. This is enforced in the code, not documented
+as advice, because the failure modes are silent and none of them look like a
+prose problem when they surface:
+
+- **SharePoint change detection is a content hash, and nothing restamps it.**
+  The `sharepoint.sync` block records a SHA-256 of the `.md`; the canonical form
+  strips only the sync block itself, so the body is hashed byte for byte. A
+  reflow therefore reads as a user edit forever. Under the default
+  `update_office: false` that is `SKIP_MD_UPDATE`, which only warns — and
+  because *both sides changed* also routes to `SKIP_MD_UPDATE`, the
+  office→Markdown pull can never fire again for that pair. Office-side edits
+  stop arriving in the mirror, permanently, with one log line as the only
+  signal. Under `update_office: true` it is worse in a different direction: the
+  `.docx` is re-rendered from the reflowed Markdown and uploaded, so a
+  line-break change replaces the user's Word file with a Quarto render.
+- **Confluence change detection is mtime, and the push diff is line-based.**
+  A tracked page counts as locally edited when its mtime is newer than
+  `confluence.exported_at`, so `reflow --write` marks every file it touches.
+  The push path does render and diff before writing, but the storage renderer
+  emits a soft break as a literal newline and the XHTML diff normalises
+  whitespace *within* a line only — so moving a sentence onto its own line
+  changes the diff, and the push is real. A reflow-adoption commit becomes a
+  version bump, and a watcher notification, on every page in the space. Where
+  the diff *does* come out empty the page is not restamped either, so it stays
+  flagged and is re-fetched and re-rendered on every later sync run.
+- **The steady state is a churn loop.** A remote edit pulls the file back in
+  unreflowed; the next reflow rewrites it; the next sync pushes it. Each remote
+  edit costs one spurious version.
+
+Both sync commands refuse to run against a dirty git tree, which is what turns
+this from silent corruption into a blocked sync — but only until the reflow is
+committed. That guard is not a substitute for the refusal above.
+
+Two further requirements follow from the same boundary:
+
+- **mdd-managed regions in a mirrored body are masked.** The Confluence export
+  callout (a leading block quote whose first quoted line begins with
+  `**Confluence export**`), the inserted MDD footer, and the published-office
+  callout are recognised by the classifier and passed through byte-for-byte,
+  like any other masked span. They are matched on export and stripped before a
+  push; a reflow that reshaped one could push it into the page body.
+- **Findings on a mirror are reported but are not the user's to fix.** `lint`
+  and `anchors` run over exporter-generated Markdown will flag constructs the
+  next pull regenerates identically. The guide's advice is to `.mddignore`
+  mirrors from a `prose check` gate and point `mdd prose` at authored content.
+  `mdd` ships no mirror-specific rule preset; that is a corpus's policy.
+
+Making mirrors safe to reflow is possible, and it is work on the sync side
+rather than here: a semantic rather than byte-level Markdown hash for
+[S18](S18-sharepoint-sync.md), a whitespace-insensitive push diff and a
+no-op restamp for [S14](S14-confluence-sync.md). Until those exist, `mdd prose`
+treats a mirror as read-only.
+
 ## Design Approach
 
 **Parse once, classify once, check many.** Every subcommand is a consumer of
@@ -718,6 +783,10 @@ with them.
 - [000-specs](000-specs.md) — shared conventions.
 - [S07](S07-data-protection.md) — credential and blacklist rules; this spec
   records why neither applies and what `--write` inherits instead.
+- [S14](S14-confluence-sync.md) — the Confluence mirror `reflow --write` must
+  not rewrite, and the mtime-based local-edit detection that is why.
+- [S18](S18-sharepoint-sync.md) — the SharePoint mirror, and the byte-level
+  `md_sha256_at_sync` hash that a reflow invalidates for good.
 - [S19](S19-search-command.md) — the `--json` line-delimited output convention,
   and the root-source registry this spec deliberately does not use.
 - [S21](S21-ai-rewrite-and-index.md) — `mdd ai rewrite`, whose protected-region
